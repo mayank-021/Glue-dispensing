@@ -2,13 +2,15 @@ import { useState, useEffect, useCallback } from 'react';
 import { fw } from '../lib/firmware/grblCommands.js';
 
 export function useMotionManager(payloadStatus, isEmergencyStopped) {
-  const MAX_SPEED_MMS = 300;
+  // Speeds are mm/s. At job time they are ×60 → mm/min, then clamped to SAFE_FEEDS (300 mm/min).
+  // Keep profiles ≤ 5 mm/s so Rapid never asks for more than GRBL Y max ($111=300).
+  const MAX_SPEED_MMS = 5;
   
   const defaultProfiles = {
-    Rapid: { speed: 150, accel: 1000, decel: 1000 },
-    Soldering: { speed: 50, accel: 500, decel: 500 },
-    Calibration: { speed: 20, accel: 200, decel: 200 },
-    Homing: { speed: 50, accel: 500, decel: 500 }
+    Rapid: { speed: 5, accel: 80, decel: 80 },
+    Soldering: { speed: 4, accel: 50, decel: 50 },
+    Calibration: { speed: 3, accel: 40, decel: 40 },
+    Homing: { speed: 3, accel: 50, decel: 50 }
   };
 
   const [profiles, setProfiles] = useState(() => {

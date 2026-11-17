@@ -243,6 +243,91 @@ def get_frame() -> np.ndarray | None:
     return frame
 
 
+def refine_fiducial_to_metal_pad(gray: np.ndarray, px: int, py: int, pr: int):
+    """
+    HoughCircles frequently locks onto the dark solder-mask clearance ring
+    (larger than the copper/HASL pad). Snap centre + radius to the bright
+    metallic pad so downstream isolation/fill checks see the real fiducial.
+    Returns (px, py, pr) refined, or the originals if refinement fails.
+    """
+    h, w = gray.shape[:2]
+    margin = max(pr + 14, int(pr * 1.9))
+    x1 = max(0, px - margin)
+    y1 = max(0, py - margin)
+    x2 = min(w, px + margin)
+    y2 = min(h, py + margin)
+    roi = gray[y1:y2, x1:x2]
+    if roi.size < 25:
+        return px, py, pr
+
+    blurred = cv2.GaussianBlur(roi, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    roi_cx, roi_cy = px - x1, py - y1
+    best_cnt = None
+    best_score = float("inf")
+    expected_area = max(1.0, np.pi * (pr * pr))
+
+    for cnt in contours or []:
+        area = cv2.contourArea(cnt)
+        if area < 12:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        if peri <= 0:
+            continue
+        circularity = (4 * np.pi * area) / (peri * peri)
+        if circularity < 0.35:
+            continue
+        M = cv2.moments(cnt)
+        if M["m00"] == 0:
+            continue
+        cx_cnt = M["m10"] / M["m00"]
+        cy_cnt = M["m01"] / M["m00"]
+        dist = np.hypot(cx_cnt - roi_cx, cy_cnt - roi_cy)
+        # Prefer the bright blob near the Hough centre whose size is at most
+        # the Hough radius (metal pad ⊆ clearance ring).
+        size_ratio = area / expected_area
+        if size_ratio > 1.35 or dist > max(pr * 1.15, 18):
+            continue
+        score = dist + abs(size_ratio - 0.55) * 12.0  # metal pad often ~50-70% of clearance r
+        if score < best_score:
+            best_score = score
+            best_cnt = cnt
+
+    if best_cnt is not None:
+        (fx, fy), fr = cv2.minEnclosingCircle(best_cnt)
+        if max(6, pr * 0.25) <= fr <= pr * 1.15:
+            return int(round(x1 + fx)), int(round(y1 + fy)), int(round(fr))
+
+    # Fallback: radial brightness drop (metal → dark clearance) when Otsu contours
+    # are jagged from glare, JPEG artifacts, or crosshair lines.
+    max_r = min(pr + 6, px, py, w - px - 1, h - py - 1)
+    if max_r >= 8:
+        ys, xs = np.ogrid[-max_r:max_r + 1, -max_r:max_r + 1]
+        dist_map = np.sqrt(xs.astype(np.float32) ** 2 + ys.astype(np.float32) ** 2)
+        patch = gray[py - max_r:py + max_r + 1, px - max_r:px + max_r + 1]
+        if patch.shape == dist_map.shape:
+            profile = []
+            for r in range(2, max_r):
+                ring = (dist_map >= r - 0.5) & (dist_map < r + 0.5)
+                profile.append(float(patch[ring].mean()) if np.any(ring) else 0.0)
+            if len(profile) >= 4:
+                diffs = np.diff(np.asarray(profile, dtype=np.float32))
+                best_r, best_drop = None, 10.0
+                for i, drop in enumerate(diffs):
+                    r = i + 2
+                    if r < max(6, int(pr * 0.30)) or r > pr:
+                        continue
+                    if drop > best_drop:
+                        best_drop = float(drop)
+                        best_r = r
+                if best_r is not None:
+                    return px, py, int(best_r)
+
+    return px, py, pr
+
+
 # ──────────────────────────────────────────────
 # Vision Analysis (runs in a dedicated background thread)
 # ──────────────────────────────────────────────
@@ -292,7 +377,10 @@ def vision_loop():
             rx1 = (w - roi_w) // 2
             ry1 = (h - roi_h) // 2
             gray_crop = gray[ry1:ry1+roi_h, rx1:rx1+roi_w]
-            blurred = cv2.GaussianBlur(gray_crop, (7, 7), 1.5)
+            # CLAHE boosts metal-pad edges so Hough does not only see the larger clearance ring
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray_crop)
+            blurred = cv2.GaussianBlur(enhanced, (7, 7), 1.5)
 
             # Target fiducial expectations (if armed from UI)
             exp_radius_mm = float(target_info.get("expected_radius_mm", 0.5)) if target_info else 0.5
@@ -301,9 +389,11 @@ def vision_loop():
             target_label = str(target_info.get("target_id", "FID")) if target_info else "TARGET"
 
             # Dynamic search radius bounds tightly centered around expected fiducial
+            # Allow smaller radii so metal pad (inside clearance) is findable, and slightly
+            # larger max so clearance-ring hits can still be refined down to the pad.
             eff_px_mm = get_effective_px_per_mm(w)
-            hough_min_r = max(8, int(exp_radius_mm * 0.45 * eff_px_mm))
-            hough_max_r = min(110, int(exp_radius_mm * 1.50 * eff_px_mm))
+            hough_min_r = max(6, int(exp_radius_mm * 0.35 * eff_px_mm))
+            hough_max_r = min(120, int(exp_radius_mm * 1.80 * eff_px_mm))
 
             raw = cv2.HoughCircles(
                 blurred,
@@ -316,12 +406,16 @@ def vision_loop():
                 maxRadius=hough_max_r
             )
 
+            is_locked = False
             if raw is not None:
                 circles_np = np.round(raw[0, :]).astype(int)
                 # Convert pixel coordinates to machine-space mm offsets from crosshair
                 for (cpx, cpy, pr) in circles_np:
                     px = int(cpx + rx1)
                     py = int(cpy + ry1)
+                    # Snap oversized clearance-ring hits onto the bright metal pad
+                    px, py, pr = refine_fiducial_to_metal_pad(gray, px, py, int(pr))
+
                     # --- Filter 1: Solid Fill Check (Rejects Through-Holes) ---
                     box_size = int(pr * 2.5)
                     x1 = max(0, px - box_size)
@@ -400,9 +494,9 @@ def vision_loop():
                     if core_mean > 195 and boundary_mean > 140:
                         continue  # Saturated specular reflection / halo
 
-                    # Rule B: Green Dominance (Ring light reflecting on green solder mask)
-                    # Real fiducials are metallic (tin/lead-free/copper/gold) with balanced RGB or gold/copper hue.
-                    # Light reflecting on green solder mask has green channel overwhelmingly dominant over (R+B)/2.
+                    # Rule B: True green solder-mask glare (G clearly exceeds both R and B).
+                    # Mild PCB colour-cast on silver/HASL pads must NOT be rejected — those often
+                    # have gdom~10-15 while still being metallic (R ≈ G or R > G).
                     if 0 <= px < w and 0 <= py < h:
                         c_box = max(2, int(pr * 0.45))
                         c_x1, c_y1 = max(0, px - c_box), max(0, py - c_box)
@@ -410,8 +504,7 @@ def vision_loop():
                         c_patch = frame[c_y1:c_y2, c_x1:c_x2]
                         if c_patch.size > 0:
                             b_c, g_c, r_c = cv2.mean(c_patch)[:3]
-                            green_dom = g_c - (r_c + b_c) / 2.0
-                            if green_dom > 12.0 and core_mean > 140:
+                            if g_c > r_c + 15 and g_c > b_c + 15 and core_mean > 140:
                                 continue  # Glare reflection on green solder mask
 
                     # --- Filter 2: Solid Fill Check (Rejects False Geometries) ---
@@ -540,7 +633,7 @@ def vision_loop():
                     best_circle = sticky_best_circle
                     offset_dx = best_circle["offset_dx"]
                     offset_dy = best_circle["offset_dy"]
-                    locked_state = is_locked
+                    locked_state = bool(best_circle.get("locked", False))
                     conf_state = best_circle.get("confidence", 0.7)
                 else:
                     sticky_best_circle = None
@@ -699,6 +792,24 @@ def annotate_frame(frame: np.ndarray) -> np.ndarray:
         for i, line in enumerate(hud_txt):
             cv2.putText(out, line, (cx + 12, cy - 10 + i * 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+
+    # ── Detected Component Outer Boundary Outline ─────────────────
+    with state_lock:
+        comp_boundary = shared_state.get("component_boundary")
+    if comp_boundary and (time.time() - comp_boundary.get("ts", 0) < 6.0):
+        try:
+            box_pts = np.int32(comp_boundary["box"])
+            cv2.polylines(out, [box_pts], isClosed=True, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+            for pt in box_pts:
+                cv2.circle(out, (int(pt[0]), int(pt[1])), 3, (0, 255, 255), -1)
+            w_mm = comp_boundary.get("w_mm", 0)
+            h_mm = comp_boundary.get("h_mm", 0)
+            lbl = f"OUTLINE: {w_mm:.1f}x{h_mm:.1f}mm"
+            min_y_pt = min(box_pts, key=lambda p: p[1])
+            cv2.putText(out, lbl, (int(min_y_pt[0]) - 20, max(20, int(min_y_pt[1]) - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2, cv2.LINE_AA)
+        except Exception:
+            pass
 
     # ── Status Bar ───────────────────────────────────────────────
     bar_y = h - 12
@@ -998,13 +1109,14 @@ def api_snap_offset():
 
 @app.post("/api/find_component_center")
 @app.get("/api/find_component_center")
-def api_find_component_center():
+async def api_find_component_center(
+    expected_width_mm: float = 0.0,
+    expected_height_mm: float = 0.0,
+):
     """
     Detects the true center of the electronic component currently under the camera crosshair.
-    Accurately handles 2-pad discrete components (resistors, capacitors, inductors),
-    4-pad ICs/optocouplers/arrays, and single pads.
-    Distinguishes solid metallic solder pads from white silkscreen text/markings and solder mask.
-    Returns offset_dx and offset_dy in mm to jog the machine so the crosshair lands dead center.
+    Anchors on the nearest pad under the crosshair so neighboring components are never merged
+    into one outline. Optional expected_width/height constrain the search cluster.
     """
     frame = get_frame()
     if frame is None:
@@ -1012,6 +1124,19 @@ def api_find_component_center():
 
     h, w = frame.shape[:2]
     cx, cy = w / 2.0, h / 2.0
+    eff_px_mm = get_effective_px_per_mm(w)
+
+    exp_w = float(expected_width_mm) if expected_width_mm and expected_width_mm > 0.2 else 0.0
+    exp_h = float(expected_height_mm) if expected_height_mm and expected_height_mm > 0.2 else 0.0
+    exp_body_mm = max(exp_w, exp_h) if (exp_w and exp_h) else 0.0
+    # Max pad-to-pad span for ONE component. Without size hints keep tight (~3.2mm)
+    # so adjacent discrete parts are not glued into a single "pair".
+    max_cluster_mm = min(12.0, max(3.2, exp_body_mm * 1.25)) if exp_body_mm else 3.2
+    max_cluster_px = max_cluster_mm * eff_px_mm
+    if exp_body_mm:
+        max_boundary_diag_mm = float(np.hypot(exp_w, exp_h) * 1.55)
+    else:
+        max_boundary_diag_mm = 5.5
 
     # Inpaint any existing crosshair or annotation lines (e.g. yellow) so they don't corrupt contours
     b_ch, g_ch, r_ch = cv2.split(frame)
@@ -1028,10 +1153,9 @@ def api_find_component_center():
     # 2. Non-substrate features (metallic pads, silkscreen, vias, copper)
     non_mask = (~is_green) & (v_ch > 60)
 
-    # 3. Morphological cleanup:
-    # 1-pixel erosion cleanly severs touching silkscreen boundary lines from solder pads
+    # 3. Morphological cleanup — 2 iterations severs nearly-touching neighbor pads
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    eroded = cv2.erode(non_mask.astype(np.uint8) * 255, kernel, iterations=1)
+    eroded = cv2.erode(non_mask.astype(np.uint8) * 255, kernel, iterations=2)
     mask = cv2.morphologyEx(eroded, cv2.MORPH_OPEN, kernel)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -1039,9 +1163,9 @@ def api_find_component_center():
         return JSONResponse({"found": False, "error": "No contours found"})
 
     # Filter contours: pads are solid geometric shapes (solidity >= 0.60)
-    # Silkscreen text (e.g. 'C15', 'L2', 'R2', 'VO1') and line boxes have low solidity or extreme aspect ratio
-    min_area_px = 40   # Supports tiny SMD pads down to 0201/0402
-    max_area_px = 24000  # Avoid large component outlines, board perimeters or ground pours
+    min_area_px = 40
+    # Reject blobs larger than ~one large IC — stops merged neighbor-components
+    max_area_px = int(min(24000, (max_cluster_px * 1.4) ** 2))
     all_cnts = []
 
     for cnt in contours:
@@ -1054,9 +1178,9 @@ def api_find_component_center():
         aspect = max(cw, ch) / max(1.0, min(cw, ch))
 
         if solidity < 0.60:
-            continue  # Hollow silkscreen stroke or text
+            continue
         if solidity < 0.82 and aspect > 3.5:
-            continue  # Thin silkscreen border line
+            continue
 
         M = cv2.moments(cnt)
         if M["m00"] == 0:
@@ -1078,123 +1202,241 @@ def api_find_component_center():
     if not all_cnts:
         return JSONResponse({"found": False, "error": "No valid pads near crosshair"})
 
-    # Dominant pad size filtering:
-    # Eliminates tiny silkscreen text strokes and marks when dominant component pads are larger
-    near = [c for c in all_cnts if c["dist"] < 2.0 * PX_PER_MM]
+    near = [c for c in all_cnts if c["dist"] < 2.0 * eff_px_mm]
     max_area = max([c["area"] for c in near]) if near else max([c["area"] for c in all_cnts])
     min_comp_area = max(45.0, max_area * 0.18)
     pads = [c for c in all_cnts if c["area"] >= min_comp_area]
     if not pads:
         pads = all_cnts
 
-    # Sort pads by proximity to current camera crosshair
+    # Sort by proximity to crosshair — nearest pad is the ANCHOR for this component only
     pads.sort(key=lambda p: p["dist"])
+    anchor = pads[0]
 
-    # ── Category 1: Multi-pin ICs (QFN, QFP, SOIC, TSSOP with 5+ pins) ──
-    if len(pads) >= 5:
-        ic_pads = [p for p in pads if p["dist"] < 3.2 * PX_PER_MM]
-        if len(ic_pads) >= 5:
-            med_area = float(np.median([p["area"] for p in ic_pads]))
-            homo_pads = [p for p in ic_pads if 0.35 * med_area <= p["area"] <= 2.8 * med_area]
-            if len(homo_pads) >= 5:
+    # Restrict all multi-pad grouping to pads belonging to the SAME component as the anchor.
+    # This prevents pairing a pad from component A with a pad from neighboring component B.
+    cluster = [
+        p for p in pads
+        if np.hypot(p["cx"] - anchor["cx"], p["cy"] - anchor["cy"]) <= max_cluster_px
+    ]
+    if not cluster:
+        cluster = [anchor]
+    cluster.sort(key=lambda p: np.hypot(p["cx"] - anchor["cx"], p["cy"] - anchor["cy"]))
+
+    def _boundary_ok(pts) -> bool:
+        rect = cv2.minAreaRect(pts)
+        bw = float(max(rect[1]) / eff_px_mm)
+        bh = float(min(rect[1]) / eff_px_mm)
+        return float(np.hypot(bw, bh)) <= max_boundary_diag_mm + 1e-6
+
+    # ── Category 1: Multi-pin ICs inside anchor cluster (5+ pins) ──
+    if len(cluster) >= 5:
+        med_area = float(np.median([p["area"] for p in cluster]))
+        homo_pads = [p for p in cluster if 0.35 * med_area <= p["area"] <= 2.8 * med_area]
+        if len(homo_pads) >= 5:
+            pts = np.vstack([p["cnt"] for p in homo_pads])
+            if _boundary_ok(pts):
                 ic_cx = float(np.mean([p["cx"] for p in homo_pads]))
                 ic_cy = float(np.mean([p["cy"] for p in homo_pads]))
-                dist_c = float(np.hypot(ic_cx - cx, ic_cy - cy))
-                if dist_c < 2.5 * PX_PER_MM:
-                    dx_px = ic_cx - cx
-                    dy_px = cy - ic_cy
-                    return JSONResponse({
-                        "found": True,
-                        "comp_type": "ic_multi_pin",
-                        "offset_dx": round(float(dx_px / PX_PER_MM), 4),
-                        "offset_dy": round(float(dy_px / PX_PER_MM), 4),
-                        "pixel_dx": round(float(dx_px), 1),
-                        "pixel_dy": round(float(dy_px), 1),
-                        "dist_mm": round(float(np.hypot(dx_px, dy_px) / PX_PER_MM), 4),
-                        "pads_detected": len(homo_pads)
-                    })
+                rect = cv2.minAreaRect(pts)
+                box = cv2.boxPoints(rect)
+                bw_mm = round(float(max(rect[1]) / eff_px_mm), 3)
+                bh_mm = round(float(min(rect[1]) / eff_px_mm), 3)
+                perim_mm = round(float(2.0 * (bw_mm + bh_mm)), 3)
+                with state_lock:
+                    shared_state["component_boundary"] = {
+                        "box": box.tolist(), "w_mm": bw_mm, "h_mm": bh_mm, "ts": time.time()
+                    }
+                dx_px = ic_cx - cx
+                dy_px = cy - ic_cy
+                return JSONResponse({
+                    "found": True,
+                    "comp_type": "ic_multi_pin",
+                    "offset_dx": round(float(dx_px / eff_px_mm), 4),
+                    "offset_dy": round(float(dy_px / eff_px_mm), 4),
+                    "pixel_dx": round(float(dx_px), 1),
+                    "pixel_dy": round(float(dy_px), 1),
+                    "dist_mm": round(float(np.hypot(dx_px, dy_px) / eff_px_mm), 4),
+                    "pads_detected": len(homo_pads),
+                    "boundary_w_mm": bw_mm,
+                    "boundary_h_mm": bh_mm,
+                    "perimeter_mm": perim_mm,
+                    "boundary_corners_px": box.tolist()
+                })
 
-    # ── Category 2: 4-pad components (ICs / optocouplers / crystals / quad arrays) ──
+    # ── Category 2: 4-pad components inside anchor cluster ──
     best_quad = None
+    best_quad_pads = None
     best_quad_score = float("inf")
-    if len(pads) >= 4:
-        for q in itertools.combinations(pads[:8], 4):
+    if len(cluster) >= 4:
+        for q in itertools.combinations(cluster[:8], 4):
             areas = [p["area"] for p in q]
-            if max(areas) / max(1.0, min(areas)) < 2.6:
-                q_cx = sum(p["cx"] for p in q) / 4.0
-                q_cy = sum(p["cy"] for p in q) / 4.0
-                dist_to_center = float(np.hypot(q_cx - cx, q_cy - cy))
-                if dist_to_center < 2.5 * PX_PER_MM and dist_to_center < best_quad_score:
-                    # Symmetry validation: opposite pairs of pads in a true IC must share centroid within 16 px
-                    pts = [(p["cx"], p["cy"]) for p in q]
-                    best_sym = float("inf")
-                    for (i1, i2), (i3, i4) in [((0, 1), (2, 3)), ((0, 2), (1, 3)), ((0, 3), (1, 2))]:
-                        m1 = ((pts[i1][0] + pts[i2][0]) / 2.0, (pts[i1][1] + pts[i2][1]) / 2.0)
-                        m2 = ((pts[i3][0] + pts[i4][0]) / 2.0, (pts[i3][1] + pts[i4][1]) / 2.0)
-                        diff = float(np.hypot(m1[0] - m2[0], m1[1] - m2[1]))
-                        if diff < best_sym:
-                            best_sym = diff
-                    if best_sym < 16.0:
-                        best_quad_score = dist_to_center
-                        best_quad = (q_cx, q_cy)
+            if max(areas) / max(1.0, min(areas)) >= 2.6:
+                continue
+            q_cx = sum(p["cx"] for p in q) / 4.0
+            q_cy = sum(p["cy"] for p in q) / 4.0
+            # Cluster must still contain the anchor pad
+            if not any(p is anchor or (p["cx"] == anchor["cx"] and p["cy"] == anchor["cy"]) for p in q):
+                if min(np.hypot(p["cx"] - anchor["cx"], p["cy"] - anchor["cy"]) for p in q) > 1.0:
+                    # Allow if anchor is one of q by proximity
+                    if not any(np.hypot(p["cx"] - anchor["cx"], p["cy"] - anchor["cy"]) < 2.0 for p in q):
+                        continue
+            pts = [(p["cx"], p["cy"]) for p in q]
+            best_sym = float("inf")
+            for (i1, i2), (i3, i4) in [((0, 1), (2, 3)), ((0, 2), (1, 3)), ((0, 3), (1, 2))]:
+                m1 = ((pts[i1][0] + pts[i2][0]) / 2.0, (pts[i1][1] + pts[i2][1]) / 2.0)
+                m2 = ((pts[i3][0] + pts[i4][0]) / 2.0, (pts[i3][1] + pts[i4][1]) / 2.0)
+                diff = float(np.hypot(m1[0] - m2[0], m1[1] - m2[1]))
+                if diff < best_sym:
+                    best_sym = diff
+            if best_sym >= 16.0:
+                continue
+            stacked = np.vstack([p["cnt"] for p in q])
+            if not _boundary_ok(stacked):
+                continue
+            # Prefer groups whose centroid is near crosshair AND includes nearby pads
+            dist_to_center = float(np.hypot(q_cx - cx, q_cy - cy))
+            score = dist_to_center + 0.15 * min(np.hypot(p["cx"] - anchor["cx"], p["cy"] - anchor["cy"]) for p in q)
+            if score < best_quad_score:
+                best_quad_score = score
+                best_quad = (q_cx, q_cy)
+                best_quad_pads = q
 
-    # ── Category 3: 3-pad components (SOT-23 / SOT-89 / SOT-223 / SOT-323 transistors, diodes, regulators) ──
+    # ── Category 3: 3-pad (SOT-23 family) inside anchor cluster ──
     best_triplet = None
+    best_triplet_pads = None
     best_triplet_score = float("inf")
-    if len(pads) >= 3:
-        for t in itertools.combinations(pads[:6], 3):
+    if len(cluster) >= 3:
+        for t in itertools.combinations(cluster[:6], 3):
             areas = [p["area"] for p in t]
-            if max(areas) / max(1.0, min(areas)) < 3.2:
-                t_cx = sum(p["cx"] for p in t) / 3.0
-                t_cy = sum(p["cy"] for p in t) / 3.0
-                dist_to_center = float(np.hypot(t_cx - cx, t_cy - cy))
-                p_dists = [
-                    np.hypot(t[0]["cx"] - t[1]["cx"], t[0]["cy"] - t[1]["cy"]),
-                    np.hypot(t[1]["cx"] - t[2]["cx"], t[1]["cy"] - t[2]["cy"]),
-                    np.hypot(t[0]["cx"] - t[2]["cx"], t[0]["cy"] - t[2]["cy"])
-                ]
-                max_d_mm = max(p_dists) / PX_PER_MM
-                if 0.35 <= max_d_mm <= 4.8 and dist_to_center < 2.5 * PX_PER_MM and dist_to_center < best_triplet_score:
-                    best_triplet_score = dist_to_center
-                    best_triplet = (t_cx, t_cy)
+            if max(areas) / max(1.0, min(areas)) >= 3.2:
+                continue
+            if not any(np.hypot(p["cx"] - anchor["cx"], p["cy"] - anchor["cy"]) < 2.0 for p in t):
+                continue
+            t_cx = sum(p["cx"] for p in t) / 3.0
+            t_cy = sum(p["cy"] for p in t) / 3.0
+            p_dists = [
+                np.hypot(t[0]["cx"] - t[1]["cx"], t[0]["cy"] - t[1]["cy"]),
+                np.hypot(t[1]["cx"] - t[2]["cx"], t[1]["cy"] - t[2]["cy"]),
+                np.hypot(t[0]["cx"] - t[2]["cx"], t[0]["cy"] - t[2]["cy"])
+            ]
+            max_d_mm = max(p_dists) / eff_px_mm
+            if not (0.35 <= max_d_mm <= max_cluster_mm):
+                continue
+            stacked = np.vstack([p["cnt"] for p in t])
+            if not _boundary_ok(stacked):
+                continue
+            dist_to_center = float(np.hypot(t_cx - cx, t_cy - cy))
+            if dist_to_center < best_triplet_score:
+                best_triplet_score = dist_to_center
+                best_triplet = (t_cx, t_cy)
+                best_triplet_pads = t
 
-    # ── Category 4: 2-pad discrete components (resistors, capacitors, inductors, LEDs, diodes) ──
+    # ── Category 4: 2-pad discrete — ONLY pair anchor with a nearby partner ──
     best_pair = None
+    best_pair_pads = None
     best_pair_score = float("inf")
-    for i in range(min(6, len(pads))):
-        for j in range(i + 1, min(7, len(pads))):
-            p1, p2 = pads[i], pads[j]
-            area_ratio = max(p1["area"], p2["area"]) / max(1.0, min(p1["area"], p2["area"]))
-            if area_ratio < 3.0:
-                pad_dist_mm = float(np.hypot(p1["cx"] - p2["cx"], p1["cy"] - p2["cy"]) / PX_PER_MM)
-                if 0.20 <= pad_dist_mm <= 8.5:
-                    mid_x = (p1["cx"] + p2["cx"]) / 2.0
-                    mid_y = (p1["cy"] + p2["cy"]) / 2.0
-                    dist_to_center = float(np.hypot(mid_x - cx, mid_y - cy))
-                    if dist_to_center < 3.5 * PX_PER_MM and dist_to_center < best_pair_score:
-                        best_pair_score = dist_to_center
-                        best_pair = (mid_x, mid_y)
+    max_pair_mm = max_cluster_mm
+    for p2 in cluster[1:6]:
+        area_ratio = max(anchor["area"], p2["area"]) / max(1.0, min(anchor["area"], p2["area"]))
+        if area_ratio >= 3.0:
+            continue
+        pad_dist_mm = float(np.hypot(anchor["cx"] - p2["cx"], anchor["cy"] - p2["cy"]) / eff_px_mm)
+        if not (0.20 <= pad_dist_mm <= max_pair_mm):
+            continue
+        # Reject if a third similar-sized pad sits between them (two neighbor components)
+        mid_x = (anchor["cx"] + p2["cx"]) / 2.0
+        mid_y = (anchor["cy"] + p2["cy"]) / 2.0
+        gap = float(np.hypot(anchor["cx"] - p2["cx"], anchor["cy"] - p2["cy"]))
+        interloper = False
+        for p3 in pads:
+            if p3 is anchor or p3 is p2:
+                continue
+            if abs(p3["area"] - anchor["area"]) / max(1.0, anchor["area"]) > 1.5:
+                continue
+            d_mid = float(np.hypot(p3["cx"] - mid_x, p3["cy"] - mid_y))
+            if d_mid < gap * 0.45:
+                interloper = True
+                break
+        if interloper:
+            continue
+        stacked = np.vstack([anchor["cnt"], p2["cnt"]])
+        if not _boundary_ok(stacked):
+            continue
+        # Score: prefer partners close to anchor; midpoint should not wander far from crosshair
+        dist_mid = float(np.hypot(mid_x - cx, mid_y - cy))
+        score = dist_mid + 0.35 * pad_dist_mm * eff_px_mm
+        if score < best_pair_score:
+            best_pair_score = score
+            best_pair = (mid_x, mid_y)
+            best_pair_pads = (anchor, p2)
 
-    # Hierarchy: prioritize multi-pin IC / quad symmetry / triplet / pair / single
+    # If crosshair is clearly sitting on the anchor pad itself, prefer single-pad
+    # over a weak distant pair (stops "rotating around two components").
+    anchor_half = 0.5 * max(anchor["w"], anchor["h"])
+    crosshair_on_anchor = anchor["dist"] <= max(anchor_half * 1.15, 0.35 * eff_px_mm)
+
+    # Hierarchy within the anchor cluster only
     if best_quad and (not best_pair or best_quad_score < best_pair_score * 0.75):
         comp_cx, comp_cy = best_quad
         comp_type = "quad"
+        all_pts = np.vstack([p["cnt"] for p in best_quad_pads])
+        pad_count = len(best_quad_pads)
     elif best_triplet and (not best_pair or best_triplet_score < best_pair_score * 0.65):
         comp_cx, comp_cy = best_triplet
         comp_type = "sot23_triplet"
-    elif best_pair:
+        all_pts = np.vstack([p["cnt"] for p in best_triplet_pads])
+        pad_count = len(best_triplet_pads)
+    elif best_pair and not (crosshair_on_anchor and best_pair_score > anchor["dist"] + 0.6 * eff_px_mm):
         comp_cx, comp_cy = best_pair
         comp_type = "pair"
+        all_pts = np.vstack([best_pair_pads[0]["cnt"], best_pair_pads[1]["cnt"]])
+        pad_count = 2
     else:
-        # Fall back to most solid pad near crosshair
-        solid_pads = [p for p in pads if p["solidity"] > 0.80]
-        target = solid_pads[0] if solid_pads else pads[0]
-        comp_cx, comp_cy = target["cx"], target["cy"]
+        comp_cx, comp_cy = anchor["cx"], anchor["cy"]
         comp_type = "single"
+        all_pts = anchor["cnt"]
+        pad_count = 1
 
-    eff_px_mm = get_effective_px_per_mm(w)
+    rect = cv2.minAreaRect(all_pts)
+    raw_bw_mm = float(max(rect[1]) / eff_px_mm)
+    raw_bh_mm = float(min(rect[1]) / eff_px_mm)
+
+    # Final guard: refuse absurd merged outlines (check RAW pad cloud before size snap)
+    if float(np.hypot(raw_bw_mm, raw_bh_mm)) > max_boundary_diag_mm * 1.05 and pad_count > 1:
+        comp_cx, comp_cy = anchor["cx"], anchor["cy"]
+        comp_type = "single"
+        all_pts = anchor["cnt"]
+        pad_count = 1
+        rect = cv2.minAreaRect(all_pts)
+        raw_bw_mm = float(max(rect[1]) / eff_px_mm)
+        raw_bh_mm = float(min(rect[1]) / eff_px_mm)
+
+    angle = rect[2]
+    # Prefer design body size for the green outline so it matches ONE component,
+    # not a merged cloud of neighboring pads.
+    if exp_w > 0.2 and exp_h > 0.2:
+        long_mm, short_mm = max(exp_w, exp_h), min(exp_w, exp_h)
+        box = cv2.boxPoints(((comp_cx, comp_cy), (long_mm * eff_px_mm, short_mm * eff_px_mm), angle))
+        bw_mm = round(long_mm, 3)
+        bh_mm = round(short_mm, 3)
+    else:
+        box = cv2.boxPoints(rect)
+        bw_mm = round(raw_bw_mm, 3)
+        bh_mm = round(raw_bh_mm, 3)
+
+    perim_mm = round(float(2.0 * (bw_mm + bh_mm)), 3)
+
+    with state_lock:
+        shared_state["component_boundary"] = {
+            "box": box.tolist(),
+            "w_mm": bw_mm,
+            "h_mm": bh_mm,
+            "ts": time.time()
+        }
+
     dx_px = comp_cx - cx
-    dy_px = cy - comp_cy  # Camera image Y is inverted relative to machine coordinates (down -> up)
+    dy_px = cy - comp_cy
     offset_dx = round(float(dx_px / eff_px_mm), 4)
     offset_dy = round(float(dy_px / eff_px_mm), 4)
 
@@ -1206,7 +1448,11 @@ def api_find_component_center():
         "pixel_dx": round(float(dx_px), 1),
         "pixel_dy": round(float(dy_px), 1),
         "dist_mm": round(float(np.hypot(offset_dx, offset_dy)), 4),
-        "pads_detected": len(pads)
+        "pads_detected": pad_count,
+        "boundary_w_mm": bw_mm,
+        "boundary_h_mm": bh_mm,
+        "perimeter_mm": perim_mm,
+        "boundary_corners_px": box.tolist()
     })
 
 

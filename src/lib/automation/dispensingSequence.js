@@ -1,10 +1,11 @@
 import { applyTransform } from '../utils/transform2d.js';
+import { getComponentBoundaryOffsets, calculatePerimeterLength } from '../../components/dispensingHelpers.jsx';
 
 export class DispensingSequencer {
   constructor() {
     this.safeHeight = 5; // mm above PCB
-    this.travelSpeed = 500; // mm/min (normal smooth travel speed, no jerking)
-    this.dispensingSpeed = 400; // mm/min
+    this.travelSpeed = 300; // mm/min — safe feed (≤ GRBL $111) to avoid lost steps / jerk
+    this.dispensingSpeed = 250; // mm/min — safe outline trace (≤ GRBL Y max)
   }
 
   calculateOptimalSequence(referencePoint, pads, config = {}) {
@@ -170,18 +171,14 @@ export class DispensingSequencer {
         mapped = applyTransform(xf, mapped);
       }
       // The nozzle is physically offset from the camera's assumed position.
-      // If camera is at X:0, and nozzle is at dx:-30 (30mm to the left), 
-      // to put the NOZZLE on the target, we must tell the machine to move to target - (-30) = target + 30.
-      // E.g., Move machine to X:30 so the nozzle (at X-30) lands perfectly at X:0.
-      // Wait, let's trace this math. If Tool is at Camera + Offset.
-      // Offset dx = -30 (Needle is at -30 when camera is at 0).
-      // We want Needle to be at Target (T).
-      // MachinePos + Offset = T 
-      // MachinePos = T - Offset
+      // posA = needle position on dot, posB = camera position on dot.
+      // toolOffset.dx = posA.x - posB.x.
+      // To shift the gantry from camera coordinate to needle position:
+      // MachinePos = Target + toolOffset
       return {
         ...mapped,
-        x: mapped.x - toolOffset.dx,
-        y: mapped.y - toolOffset.dy
+        x: mapped.x + (toolOffset?.dx || 0),
+        y: mapped.y + (toolOffset?.dy || 0)
       };
     };
 
@@ -200,23 +197,36 @@ export class DispensingSequencer {
     gcode.push(`G1 Z${safeHeight} F${travelSpeed} ; Lift to safe travel height`);
     gcode.push('');
 
-    // Dispense on each pad in sequence
+    // Dispense along the outer boundary / outline of each component in sequence
     pads.forEach((pad, index) => {
-      const p = transform(pad);
-      gcode.push(`; --- Pad ${index + 1}/${pads.length} ---`);
+      const boundaryOffsets = getComponentBoundaryOffsets(pad);
+      const boundaryVertices = boundaryOffsets.map(bo => transform({ x: pad.x + bo.dx, y: pad.y + bo.dy }));
+      const v0 = boundaryVertices[0];
 
-      // Travel to pad position (safe height)
-      gcode.push(`G1 X${p.x.toFixed(3)} Y${p.y.toFixed(3)} Z${safeHeight} F${travelSpeed}`);
+      gcode.push(`; --- Component ${index + 1}/${pads.length}: ${pad.id || `C${index + 1}`} (Outer Boundary Outline) ---`);
+
+      // Travel to first boundary vertex (safe height)
+      gcode.push(`G1 X${v0.x.toFixed(3)} Y${v0.y.toFixed(3)} Z${safeHeight} F${travelSpeed}`);
 
       // Lower to dispensing height
       gcode.push(`G1 Z${dispenseHeight} F${dispensingSpeed} ; Lower nozzle to dispense`);
 
-      // Apply pressure and dispense
-      const dwellTime = this.calculateDwellTime(pad, pressureSettings);
+      // Valve ON — begin tracing outer boundary outline
+      gcode.push(`${valveOnCmd} ; Valve ON (Begin boundary trace)`);
 
-      gcode.push(`${valveOnCmd} ; Valve ON`);
-      gcode.push(`G4 P${dwellTime} ; Dwell (dispense) for ${dwellTime}ms`);
-      gcode.push(`${valveOffCmd} ; Valve OFF`);
+      for (let vi = 1; vi < boundaryVertices.length; vi++) {
+        const v = boundaryVertices[vi];
+        gcode.push(`G1 X${v.x.toFixed(3)} Y${v.y.toFixed(3)} F${dispensingSpeed}`);
+      }
+
+      // Ensure closed perimeter back to start point
+      const lastV = boundaryVertices[boundaryVertices.length - 1];
+      if (Math.hypot(lastV.x - v0.x, lastV.y - v0.y) > 0.005) {
+        gcode.push(`G1 X${v0.x.toFixed(3)} Y${v0.y.toFixed(3)} F${dispensingSpeed}`);
+      }
+
+      // Valve OFF
+      gcode.push(`${valveOffCmd} ; Valve OFF (Boundary trace complete)`);
 
       // Lift to safe height
       gcode.push(`G1 Z${safeHeight} F${travelSpeed} ; Retract to safe height`);
@@ -250,13 +260,17 @@ export class DispensingSequencer {
     let currentPoint = referencePoint;
 
     sequence.forEach(pad => {
-      const distance = this.calculateDistance(currentPoint, pad);
-      totalDistance += distance;
+      const travelDist = this.calculateDistance(currentPoint, pad);
+      const boundaryOffsets = getComponentBoundaryOffsets(pad);
+      const perimeter = calculatePerimeterLength(boundaryOffsets);
 
-      // Travel time + dispensing time
-      const travelTime = (distance / this.travelSpeed) * 60; // convert to seconds
-      const dispensingTime = 2; // estimated 2 seconds per pad
-      totalTime += travelTime + dispensingTime;
+      totalDistance += travelDist + perimeter;
+
+      // Travel time between components + boundary tracing time + Z clearance overhead
+      const travelTime = (travelDist / this.travelSpeed) * 60; // convert to seconds
+      const perimeterTime = (perimeter / this.dispensingSpeed) * 60;
+      const zOverhead = 0.5; // plunge and retract time
+      totalTime += travelTime + perimeterTime + zOverhead;
 
       currentPoint = pad;
     });
@@ -331,28 +345,14 @@ export class DispensingSequencer {
   }
 
   /**
-   * Decide whether a pad should use a single dot or a continuous bead dispense.
-   *
-   * Rules:
-   *  - Sub-dots (already expanded from a larger pad) always use dot mode — the grid covers the area.
-   *  - Pads whose area is below beadAreaThreshold → dot mode.
-   *  - Larger pads → bead along the longer dimension (height or width).
+   * Determine dispensing mode for component: always uses outer boundary outline tracing.
    *
    * @param {Object} pad
-   * @param {Object} opts
-   * @param {number} opts.beadAreaThreshold  - mm² above which bead mode activates (default 2.0)
-   * @returns {{ mode: 'dot'|'bead', axis: 'X'|'Y', length: number }}
+   * @returns {{ mode: 'outline', perimeter: number, length: number }}
    */
-  selectDispenseMode(pad, { beadAreaThreshold = 2.0 } = {}) {
-    if (pad.isSubDot) return { mode: 'dot', axis: 'Y', length: 0 };
-
-    const area = this.calculatePadArea(pad);
-    if (area < beadAreaThreshold) return { mode: 'dot', axis: 'Y', length: 0 };
-
-    const w = pad.width  || 0;
-    const h = pad.height || 0;
-    const axis   = h >= w ? 'Y' : 'X';
-    const length = axis === 'Y' ? h : w;
-    return { mode: 'bead', axis, length };
+  selectDispenseMode(pad) {
+    const boundaryOffsets = getComponentBoundaryOffsets(pad);
+    const perimeter = calculatePerimeterLength(boundaryOffsets);
+    return { mode: 'outline', perimeter, length: perimeter };
   }
 }

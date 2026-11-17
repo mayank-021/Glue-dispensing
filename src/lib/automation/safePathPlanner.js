@@ -1,5 +1,7 @@
 import { applyTransform } from '../utils/transform2d.js';
 import { fw } from '../firmware/grblCommands.js';
+import { getComponentBoundaryOffsets } from '../../components/dispensingHelpers.jsx';
+import { SAFE_FEEDS, clampFeedXY, clampFeedZ } from '../motion/gcode.js';
 
 export class SafePathPlanner {
   constructor(options = {}) {
@@ -112,7 +114,7 @@ export class SafePathPlanner {
     gcode.push('G21 ; Set units to millimeters');
     gcode.push('G90 ; Absolute positioning');
     gcode.push('$H ; Home all axes (GRBL)');
-    gcode.push(`G1 Z${this.safeHeight} F600 ; Move to safe height`);
+    gcode.push(`G1 Z${this.safeHeight} F${SAFE_FEEDS.z} ; Move to safe height`);
     gcode.push('');
 
     // Process each pad in safe sequence
@@ -121,8 +123,8 @@ export class SafePathPlanner {
 
       // Execute each path segment (Lift, Travel, Lower)
       pad.safePath.segments.forEach(segment => {
-        const defaultTravelFeed = settings.travelFeed || 500;
-        const defaultPlungeFeed = settings.plungeFeed || 400;
+        const defaultTravelFeed = clampFeedXY(settings.travelFeed || SAFE_FEEDS.travelXY);
+        const defaultPlungeFeed = clampFeedZ(settings.plungeFeed || SAFE_FEEDS.z);
         const speed = segment.type === 'travel' ? defaultTravelFeed : defaultPlungeFeed;
 
         // Transform the end point (target) of the segment
@@ -132,14 +134,25 @@ export class SafePathPlanner {
         gcode.push(`G1 X${target.x.toFixed(3)} Y${target.y.toFixed(3)} Z${target.z !== undefined ? target.z.toFixed(3) : segment.end.z.toFixed(3)} F${speed}`);
       });
 
-      // Dispense
-      gcode.push(`${fw.dispenserOn(25)} ; Start dispensing`);
-      gcode.push('G4 P0.12 ; Dwell 120ms (GRBL seconds)');
-      gcode.push(`${fw.dispenserOff} ; Stop dispensing`);
+      // Dispense along outer boundary outline
+      const boundaryOffsets = getComponentBoundaryOffsets(pad);
+      const boundaryVertices = boundaryOffsets.map(bo => transform({ x: pad.x + bo.dx, y: pad.y + bo.dy }));
+      const v0 = boundaryVertices[0];
+      const dispenseF = SAFE_FEEDS.dispenseXY;
+
+      gcode.push(`${fw.dispenserOn(25)} ; Start boundary dispensing`);
+      for (let vi = 1; vi < boundaryVertices.length; vi++) {
+        const v = boundaryVertices[vi];
+        gcode.push(`G1 X${v.x.toFixed(3)} Y${v.y.toFixed(3)} F${dispenseF}`);
+      }
+      if (Math.hypot(boundaryVertices[boundaryVertices.length - 1].x - v0.x, boundaryVertices[boundaryVertices.length - 1].y - v0.y) > 0.005) {
+        gcode.push(`G1 X${v0.x.toFixed(3)} Y${v0.y.toFixed(3)} F${dispenseF}`);
+      }
+      gcode.push(`${fw.dispenserOff} ; Stop boundary dispensing`);
       gcode.push('');
     });
 
-    gcode.push(`G1 Z${this.safeHeight} F600 ; Lift before home`);
+    gcode.push(`G1 Z${this.safeHeight} F${SAFE_FEEDS.z} ; Lift before home`);
     gcode.push('$H ; Return home (GRBL)');
     // Note: M84 (disable steppers) is Marlin-specific and not available in GRBL
 
@@ -166,14 +179,10 @@ export class SafePathPlanner {
       const distance = pad.pathDistance || 0;
       totalDistance += distance;
 
-      // Travel time (approximate based on feed rates)
-      // Low Z Speed (Lift/Lower) ~ 1000mm/min
-      // High XY Speed (Travel) ~ 3000mm/min
-      // Simplified: average speed check
-
+      // Travel time from safe feed rates (matches GRBL $110/$111 caps)
       let padTime = 0;
       pad.safePath.segments.forEach(seg => {
-        const speed = seg.type === 'travel' ? 3000 : 1000;
+        const speed = seg.type === 'travel' ? SAFE_FEEDS.travelXY : SAFE_FEEDS.z;
         padTime += (seg.distance / speed) * 60;
       });
 

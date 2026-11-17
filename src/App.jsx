@@ -20,6 +20,7 @@ import { QualityController } from "./lib/quality/qualityControl.js";
 import { NozzleMaintenanceManager } from "./lib/maintenance/nozzleMaintenance.js";
 import { generatePath } from "./lib/motion/pathGeneration.js";
 import { DispensingSequencer } from "./lib/automation/dispensingSequence.js";
+import { groupPadsIntoComponents } from "./components/dispensingHelpers.jsx";
 import { SafePathPlanner } from "./lib/automation/safePathPlanner.js";
 import { extractPadsWithPanel } from "./lib/gerber/extractPads.js";
 import { detectPanelFromFiducials } from "./components/dispensingHelpers.jsx";
@@ -452,15 +453,35 @@ export default function App() {
   const [maintenanceAlert, setMaintenanceAlert] = useState(null);
   const [toolOffset, setToolOffset] = useState(() => {
     try {
-      return JSON.parse(localStorage.getItem("toolOffset") || '{"dx": 0, "dy": 0');
+      const stored = localStorage.getItem("toolOffset") || localStorage.getItem("nozzleMaintenance_toolOffset");
+      return stored ? JSON.parse(stored) : { dx: 0, dy: 0 };
     } catch (error) {
       return { dx: 0, dy: 0 };
     }
   });
 
+  const handleUpdateToolOffset = useCallback((newOffset) => {
+    setToolOffset(newOffset);
+    if (maintenanceManager) {
+      maintenanceManager.setToolOffset(newOffset);
+    }
+    try {
+      localStorage.setItem("toolOffset", JSON.stringify(newOffset));
+      localStorage.setItem("nozzleMaintenance_toolOffset", JSON.stringify(newOffset));
+      window.dispatchEvent(new Event('storage'));
+    } catch (e) {}
+    forceRender({});
+  }, [maintenanceManager, forceRender]);
+
   useEffect(() => {
-    localStorage.setItem("toolOffset", JSON.stringify(toolOffset));
-  }, [toolOffset]);
+    try {
+      localStorage.setItem("toolOffset", JSON.stringify(toolOffset));
+      localStorage.setItem("nozzleMaintenance_toolOffset", JSON.stringify(toolOffset));
+    } catch {}
+    if (maintenanceManager) {
+      maintenanceManager.setToolOffset(toolOffset);
+    }
+  }, [toolOffset, maintenanceManager]);
 
   useEffect(() => {
     localStorage.setItem("pcbOriginOffset", JSON.stringify(pcbOriginOffset));
@@ -1489,9 +1510,13 @@ export default function App() {
   useEffect(() => {
     const refPoint = referencePoint || selectedOrigin;
 
-    const padsToUse = selectedPadIndices.length > 0
+    const rawPads = selectedPadIndices.length > 0
       ? selectedPadIndices.map(i => pads[i]).filter(Boolean)
       : pads;
+
+    // Group copper flashes by refdes → one outline per COMPONENT (not per pad).
+    // VO1/Q1 multi-pad footprints become a single bbox around all their pads.
+    const padsToUse = groupPadsIntoComponents(rawPads);
 
     if (refPoint && padsToUse.length > 0) {
       if (useSafePathPlanning) {
@@ -1517,9 +1542,10 @@ export default function App() {
         };
         setJobStatistics(stats);
       } else {
+        // Outline mode: never expand into sub-dots (that would outline each pad fragment)
         const sequence = dispensingSequencer.calculateOptimalSequence(refPoint, padsToUse, {
           nozzleDia: parseFloat(nozzleDia) || 0.8,
-          enableMultiDot: true
+          enableMultiDot: false
         });
         setDispensingSequence(sequence);
         setSafeSequence([]);
@@ -2230,11 +2256,8 @@ export default function App() {
 
 
             <ToolOffsetCalibration
-              toolOffset={maintenanceManager.getToolOffset()}
-              setToolOffset={(o) => {
-                maintenanceManager.setToolOffset(o);
-                forceRender({});
-              }}
+              toolOffset={toolOffset}
+              setToolOffset={handleUpdateToolOffset}
               machinePosition={livePreview.machinePosition || machinePos}
               isConnected={isSerialConnected}
               onAutoDetect={async () => {
@@ -2732,8 +2755,8 @@ export default function App() {
                 applyXf={applyXf}
                 selectedDesign={selectedOrigin ? selectedOrigin : (selectedMm ? { x: selectedMm.x, y: selectedMm.y } : null)}
                 effectiveOrigin={effectiveOrigin}
-                toolOffset={maintenanceManager.getToolOffset()}
-                setToolOffset={(o) => maintenanceManager.setToolOffset(o)}
+                toolOffset={toolOffset}
+                setToolOffset={handleUpdateToolOffset}
                 pixelsPerMm={maintenanceManager.getPixelsPerMm()}
                 setPixelsPerMm={(val) => {
                   maintenanceManager.setPixelsPerMm(val);
@@ -2787,6 +2810,7 @@ export default function App() {
             <div style={{ display: activeComponent === 'AutomatedDispensingPanel' ? 'block' : 'none', width: '100%', height: '100%' }}>
               <AutomatedDispensingPanel
                 side={side}
+                pads={pads}
                 dispensingSequencer={dispensingSequencer}
                 dispensingSequence={dispensingSequence}
                 safeSequence={safeSequence}
@@ -2806,7 +2830,7 @@ export default function App() {
                 boardOutline={boardOutline}
                 useSafePathPlanning={useSafePathPlanning}
                 setUseSafePathPlanning={setUseSafePathPlanning}
-                toolOffset={maintenanceManager.getToolOffset()}
+                toolOffset={toolOffset}
                 componentHeights={componentHeights}
                 setComponentHeights={setComponentHeights}
                 fiducials={fiducials}

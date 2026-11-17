@@ -3,7 +3,7 @@ import { useToast } from '../Toast.jsx';
 import { fitSimilarity, applyTransform } from "../lib/utils/transform2d.js";
 import { FiducialVisionDetector } from "../lib/vision/fiducialVision.js";
 import { PadDetector } from "../lib/vision/padDetection.js";
-import { jogRel, moveAbs } from "../lib/motion/gcode";
+import { jogRel, moveAbs, SAFE_FEEDS } from "../lib/motion/gcode";
 import { fw } from '../lib/firmware/grblCommands.js';
 import "./CameraPanel.css";
 
@@ -326,7 +326,7 @@ export default function CameraPanel({
           const distMm = Math.hypot(dxMm, result.offset.y);
           // Only jog if offset is meaningful (> 20µm) and not a false positive (< 3mm)
           if (distMm > 0.02 && distMm < 3.0) {
-            const cmds = jogRel({ dx: dxMm, dy: result.offset.y, feed: 400 });
+            const cmds = jogRel({ dx: dxMm, dy: result.offset.y, feed: SAFE_FEEDS.jog });
             if (window.serial && window.serial.writeLine) {
               for (const line of cmds) await window.serial.writeLine(line);
             }
@@ -688,7 +688,7 @@ export default function CameraPanel({
       if (isBusy) return;
       setIsBusy(true);
       try {
-        const cmds = jogRel({ dx, dy, feed: 400 });
+        const cmds = jogRel({ dx, dy, feed: SAFE_FEEDS.jog });
         if (window.serial && window.serial.writeLine) {
           for (const line of cmds) await window.serial.writeLine(line);
           setIsBusy(false);
@@ -982,7 +982,7 @@ export default function CameraPanel({
       cProps.setFidActiveId(targetFid.uniqueKey || targetFid.id);
     }
 
-    const NAV_FEED = 400; // mm/min (smooth, high-torque travel rate to eliminate motor stalls & noise spikes)
+    const NAV_FEED = 300; // mm/min — safe feed (≤ GRBL $111 Y max) to prevent lost steps / jerk
     const transitSec = (dist / NAV_FEED) * 60;
     const transitMs = Math.max(800, Math.round(transitSec * 1000) + 400);
     settleUntilRef.current = Date.now() + transitMs;
@@ -1080,6 +1080,11 @@ export default function CameraPanel({
   };
 
   useEffect(() => {
+    servoStateRef.current = { phase: 'idle', lockedAt: null };
+    convergenceCountRef.current = 0;
+    settleUntilRef.current = 0;
+    saveBlockRef.current = 0;
+
     if (!fidActiveId) {
       if (pythonMode) fetch(`${PYTHON_URL}/api/clear_target`, { method: 'POST' }).catch(() => {});
       setAutoSearchStatus('');
@@ -1430,6 +1435,12 @@ export default function CameraPanel({
     const allSeq = getFullFiducialSequence(cProps);
     const targetFid = allSeq.find(f => (f.uniqueKey || f.id) === fidActiveId) || allSeq.find(f => !f.machine) || allSeq[0];
 
+    // Reset servo and save block states so detection centers immediately
+    servoStateRef.current = { phase: 'idle', lockedAt: null };
+    convergenceCountRef.current = 0;
+    settleUntilRef.current = 0;
+    saveBlockRef.current = 0;
+
     // Start continuous detection
     startContinuousDetection(true);
 
@@ -1493,7 +1504,7 @@ export default function CameraPanel({
       const targetX = designCoord.x - (camOff.dx || 0);
       const targetY = designCoord.y - (camOff.dy || 0);
       await window.serial.writeLine(fw.absMode);
-      await window.serial.writeLine(`G1 X${targetX.toFixed(3)} Y${targetY.toFixed(3)} F400`);
+      await window.serial.writeLine(`G1 X${targetX.toFixed(3)} Y${targetY.toFixed(3)} F300`);
       toast.info(`Moving machine head near design position (${designCoord.x.toFixed(2)}, ${designCoord.y.toFixed(2)})...`);
     } catch (e) {
       toast.error(`Failed to move: ${e.message}`);
@@ -1620,21 +1631,33 @@ export default function CameraPanel({
             if (dist > 8.0) return; // no fiducial in view
           }
 
-          // Safety Filter: Ensure candidate does not match a known Gerber component pad
+          // Safety Filter: reject candidates that land on real component pads.
+          // SKIP when Python already locked a fiducial — Gerber often extracts the
+          // fiducial copper itself as a "pad", which would false-trigger and block
+          // centering (dx/dy never applied → crosshair never settles on centre).
           const cProps = latestPropsRef.current;
-          if (cProps.pads && cProps.pads.length > 0) {
+          const visionLocked = data.locked === true && (data.confidence || 0) >= 0.50;
+          if (!visionLocked && cProps.pads && cProps.pads.length > 0) {
             const currentMachine = machinePositionRef.current || { x: 0, y: 0 };
             const candidateMachX = currentMachine.x + (cameraOffset?.dx || 0) + dx;
             const candidateMachY = currentMachine.y + (cameraOffset?.dy || 0) + dy;
 
+            // Fiducial copper pads in Gerber must not count as "component pads"
+            const fidDesigns = getFullFiducialSequence(cProps)
+              .map(f => f.design)
+              .filter(d => d && typeof d.x === 'number' && typeof d.y === 'number');
+            const isFiducialPad = (p) => fidDesigns.some(fd =>
+              Math.hypot((p.x || 0) - fd.x, (p.y || 0) - fd.y) < 1.0
+            );
+
             const isPadMatch = cProps.pads.some(p => {
+              if (isFiducialPad(p)) return false;
               const pWorld = (cProps.applyXf && cProps.xf)
                 ? applyTransform(cProps.xf, p)
                 : (cProps.effectiveOrigin ? { x: p.x + cProps.effectiveOrigin.x, y: p.y + cProps.effectiveOrigin.y } : p);
               return Math.hypot(pWorld.x - candidateMachX, pWorld.y - candidateMachY) < 0.35;
             });
             if (isPadMatch) {
-              console.warn('[PyServo] Ignored candidate — coincides with a known component pad location!');
               return;
             }
           }
@@ -1982,7 +2005,7 @@ export default function CameraPanel({
   const jogCameraToNozzle = async (offset) => {
     if (!offset || (offset.dx === 0 && offset.dy === 0)) return;
 
-    const cmds = jogRel({ dx: offset.dx, dy: offset.dy, feed: 400 });
+    const cmds = jogRel({ dx: offset.dx, dy: offset.dy, feed: SAFE_FEEDS.jog });
 
     if (window.serial && window.serial.writeLine) {
       for (const cmd of cmds) {
@@ -2012,7 +2035,7 @@ export default function CameraPanel({
     setIsBusy(true);
     try {
       const dist = dir * jogStep;
-      const cmds = jogRel(axis === 'X' ? { dx: dist, feed: 400 } : { dy: dist, feed: 400 });
+      const cmds = jogRel(axis === 'X' ? { dx: dist, feed: SAFE_FEEDS.jog } : { dy: dist, feed: SAFE_FEEDS.jog });
       if (window.serial && window.serial.writeLine) {
         for (const line of cmds) {
           await window.serial.writeLine(line);
@@ -2030,7 +2053,7 @@ export default function CameraPanel({
     if (isBusy) return;
     setIsBusy(true);
     try {
-      const cmds = jogRel({ dz: dir * 0.5, feed: 400 });
+      const cmds = jogRel({ dz: dir * 0.5, feed: SAFE_FEEDS.jog });
       if (window.serial && window.serial.writeLine) {
         for (const line of cmds) {
           await window.serial.writeLine(line);
@@ -2443,7 +2466,7 @@ export default function CameraPanel({
 
                 setIsBusy(true);
                 try {
-                  const cmds = jogRel({ dx, dy, feed: 400 });
+                  const cmds = jogRel({ dx, dy, feed: SAFE_FEEDS.jog });
                   if (window.serial && window.serial.writeLine) {
                     for (const line of cmds) {
                       await window.serial.writeLine(line);

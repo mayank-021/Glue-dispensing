@@ -120,22 +120,382 @@ export function autoComputePnpOffset(csvComponents, appFiducials, toleranceMm = 
 }
 
 export function classifyDotPattern(pkg) {
-  if (!pkg) return 'single';
-  const p = pkg.toLowerCase();
-  if (/^(qfp|qfn|soic|sop|ssop|tssop|lqfp|plcc|bga|lga|qsop|tso)/.test(p)) return 'quad';
-  if (/(?:^|[_\-\s])(1206|1210|1812|2010|2512)(?:[_\-\s]|$)/.test(p)) return 'dual';
-  if (/conn|hdr|jst|molex|usb|hdmi|sma/.test(p)) return 'dual';
-  return 'single';
+  if (!pkg) return 'outline';
+  return 'outline';
+}
+
+export const PACKAGE_DIMENSIONS = {
+  // Standard chip passives (mm)
+  '0201': { width: 0.6, height: 0.3 },
+  '0402': { width: 1.0, height: 0.5 },
+  '0603': { width: 1.6, height: 0.8 },
+  '0805': { width: 2.0, height: 1.25 },
+  '1206': { width: 3.2, height: 1.6 },
+  '1210': { width: 3.2, height: 2.5 },
+  '1812': { width: 4.5, height: 3.2 },
+  '2010': { width: 5.0, height: 2.5 },
+  '2512': { width: 6.3, height: 3.2 },
+  // Transistors & Diodes
+  'sot23': { width: 2.9, height: 1.6 },
+  'sot-23': { width: 2.9, height: 1.6 },
+  'sot89': { width: 4.5, height: 2.5 },
+  'sot-89': { width: 4.5, height: 2.5 },
+  'sot223': { width: 6.5, height: 3.5 },
+  'sot-223': { width: 6.5, height: 3.5 },
+  'sod123': { width: 2.7, height: 1.6 },
+  'sod-123': { width: 2.7, height: 1.6 },
+  'sod323': { width: 1.7, height: 1.25 },
+  'sod-323': { width: 1.7, height: 1.25 },
+  'sma': { width: 4.5, height: 2.6 },
+  'smb': { width: 5.4, height: 3.6 },
+  'smc': { width: 7.9, height: 5.9 },
+  // Optocouplers / SOP-4 style (VO1 footprints)
+  'sop-4': { width: 4.6, height: 6.5 },
+  'sop4': { width: 4.6, height: 6.5 },
+  'so-4': { width: 4.6, height: 6.5 },
+  'so4': { width: 4.6, height: 6.5 },
+  // IC packages
+  'soic-8': { width: 4.9, height: 3.9 },
+  'soic8': { width: 4.9, height: 3.9 },
+  'so-8': { width: 4.9, height: 3.9 },
+  'soic-14': { width: 8.65, height: 3.9 },
+  'soic-16': { width: 9.9, height: 3.9 },
+  'tssop-8': { width: 3.0, height: 4.4 },
+  'tssop-14': { width: 5.0, height: 4.4 },
+  'tssop-16': { width: 5.0, height: 4.4 },
+  'qfn-16': { width: 4.0, height: 4.0 },
+  'qfn-20': { width: 4.0, height: 4.0 },
+  'qfn-28': { width: 5.0, height: 5.0 },
+  'qfn-32': { width: 5.0, height: 5.0 },
+  'lqfp-32': { width: 7.0, height: 7.0 },
+  'lqfp-48': { width: 7.0, height: 7.0 },
+  'lqfp-64': { width: 10.0, height: 10.0 },
+};
+
+function _median(nums) {
+  if (!nums.length) return 0;
+  const s = [...nums].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+/**
+ * Bounding box of copper pads for ONE component body.
+ * Uses pad centres for span, then adds a capped pad half-size — avoids huge Gerber
+ * apertures inflating the outline across neighboring parts.
+ */
+export function computePadsBoundingBox(pads) {
+  if (!pads || pads.length === 0) return null;
+  const pts = pads.filter(p => typeof p.x === 'number' && typeof p.y === 'number');
+  if (!pts.length) return null;
+
+  const halfSizes = pts.map(p => {
+    const w = Number(p.width);
+    const h = Number(p.height);
+    // Ignore absurd aperture sizes (>3mm half) — treat as 0.4mm flash
+    const hw = (Number.isFinite(w) && w > 0 && w < 6) ? w / 2 : 0.35;
+    const hh = (Number.isFinite(h) && h > 0 && h < 6) ? h / 2 : 0.35;
+    return Math.max(hw, hh);
+  });
+  const padPad = Math.min(0.9, Math.max(0.2, _median(halfSizes)));
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x);
+    maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y);
+    maxY = Math.max(maxY, p.y);
+  }
+
+  let width = (maxX - minX) + 2 * padPad;
+  let height = (maxY - minY) + 2 * padPad;
+
+  // Safety cap so one outline never spans a whole neighborhood of parts
+  const maxLong = pts.length <= 2 ? 5.5 : pts.length <= 4 ? 8.0 : pts.length <= 8 ? 11.0 : 14.0;
+  const long = Math.max(width, height);
+  if (long > maxLong) {
+    const scale = maxLong / long;
+    width *= scale;
+    height *= scale;
+  }
+
+  return {
+    x: (minX + maxX) / 2,
+    y: (minY + maxY) / 2,
+    width: Math.max(0.4, width),
+    height: Math.max(0.4, height),
+  };
+}
+
+/**
+ * Split a pad list into proximity clusters so a shared/wrong refdes cannot
+ * pull neighboring components into one giant outline.
+ */
+function splitPadsByProximity(pads) {
+  if (!pads || pads.length <= 1) return [pads || []];
+
+  const nnds = pads.map((p, i) => {
+    let best = Infinity;
+    for (let j = 0; j < pads.length; j++) {
+      if (i === j) continue;
+      const d = Math.hypot(p.x - pads[j].x, p.y - pads[j].y);
+      if (d < best) best = d;
+    }
+    return best;
+  }).filter(d => Number.isFinite(d));
+  const medNN = _median(nnds) || 1.2;
+  // Bridge opposite sides of small ICs (~4–6mm) but not separate nearby discretes
+  const linkDist = Math.min(6.5, Math.max(2.8, medNN * 2.8));
+
+  const parent = pads.map((_, i) => i);
+  const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const unite = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[rb] = ra; };
+
+  for (let i = 0; i < pads.length; i++) {
+    for (let j = i + 1; j < pads.length; j++) {
+      if (Math.hypot(pads[i].x - pads[j].x, pads[i].y - pads[j].y) <= linkDist) {
+        unite(i, j);
+      }
+    }
+  }
+
+  const buckets = new Map();
+  pads.forEach((p, i) => {
+    const r = find(i);
+    if (!buckets.has(r)) buckets.set(r, []);
+    buckets.get(r).push(p);
+  });
+  return [...buckets.values()];
+}
+
+/**
+ * Collapse Gerber copper flashes into ONE component per refdes (TO.C,xxx).
+ * Pads without a shared identifier stay as single-pad components.
+ * Outline size = tight bounding box of that component's pads only.
+ */
+export function groupPadsIntoComponents(pads) {
+  if (!pads || pads.length === 0) return [];
+
+  const groups = new Map();
+  const singles = [];
+
+  for (const p of pads) {
+    const rawKey = (p.componentIdentifier || p.id || '').toString().trim();
+    // Synthetic ids like P12 are not real refdes — treat as lone pads
+    const isSynthetic = !rawKey || /^P\d+$/i.test(rawKey) || /_SR\d+_\d+$/i.test(rawKey);
+    if (isSynthetic) {
+      singles.push(p);
+      continue;
+    }
+    const key = rawKey;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(p);
+  }
+
+  const components = [];
+
+  const pushCluster = (id, memberPads, idSuffix = '') => {
+    const bbox = computePadsBoundingBox(memberPads);
+    if (!bbox) return;
+    const seed = memberPads[0];
+    const cid = idSuffix ? `${id}${idSuffix}` : id;
+    components.push({
+      ...seed,
+      id: cid,
+      componentIdentifier: id,
+      x: bbox.x,
+      y: bbox.y,
+      width: bbox.width,
+      height: bbox.height,
+      memberPads,
+      padCount: memberPads.length,
+      shape: 'rect',
+      centerValid: true,
+      centerMethod: memberPads.length > 1 ? 'pad_group_bbox' : (seed.centerMethod || 'gerber_flash_center'),
+      originalPad: seed.originalPad || seed,
+    });
+  };
+
+  for (const [id, memberPads] of groups) {
+    const clusters = splitPadsByProximity(memberPads);
+    if (clusters.length === 1) {
+      pushCluster(id, clusters[0]);
+    } else {
+      // Same refdes but spatially separate → keep as separate outlines (avoid 2–3 part mega-box)
+      clusters
+        .sort((a, b) => b.length - a.length)
+        .forEach((cl, idx) => pushCluster(id, cl, clusters.length > 1 ? `#${idx + 1}` : ''));
+    }
+  }
+
+  for (const p of singles) {
+    const bbox = computePadsBoundingBox([p]);
+    // Single flash: never let a bad aperture create a multi-component-sized box
+    const w = Math.min(bbox ? bbox.width : (p.width || 1), 3.2);
+    const h = Math.min(bbox ? bbox.height : (p.height || 1), 3.2);
+    components.push({
+      ...p,
+      id: p.id || p.componentIdentifier || `P${components.length + 1}`,
+      width: w,
+      height: h,
+      x: bbox ? bbox.x : p.x,
+      y: bbox ? bbox.y : p.y,
+      memberPads: [p],
+      padCount: 1,
+      shape: p.shape || 'rect',
+    });
+  }
+
+  return components;
+}
+
+export function getComponentDimensions(comp) {
+  if (!comp) return { width: 2.0, height: 1.25 };
+
+  // 0. Prefer pad-cluster bbox (multi-pad footprint → full component body)
+  const members = comp.memberPads || comp.pads;
+  if (Array.isArray(members) && members.length >= 2) {
+    const bbox = computePadsBoundingBox(members);
+    if (bbox) return { width: bbox.width, height: bbox.height };
+  }
+
+  // 1. Explicit body size already computed as a multi-pad / enriched footprint
+  if (comp.padCount >= 2 && typeof comp.width === 'number' && comp.width > 0.2
+      && typeof comp.height === 'number' && comp.height > 0.2) {
+    return { width: comp.width, height: comp.height };
+  }
+
+  const pkg = (comp.pkg || comp.package || comp.footprint || '').toLowerCase().trim();
+
+  // 2. Direct package lookup
+  if (pkg && PACKAGE_DIMENSIONS[pkg]) {
+    return { ...PACKAGE_DIMENSIONS[pkg] };
+  }
+
+  // 3. Regex match for standard chip passives in footprint name
+  if (pkg) {
+    const chipMatch = pkg.match(/(?:^|[_\-\s])(0201|0402|0603|0805|1206|1210|1812|2010|2512)(?:[_\-\s]|$)/);
+    if (chipMatch && PACKAGE_DIMENSIONS[chipMatch[1]]) {
+      return { ...PACKAGE_DIMENSIONS[chipMatch[1]] };
+    }
+
+    // 4. Regex for dimension in name like 5x5, 3x3mm, etc.
+    const dimMatch = pkg.match(/(\d+(?:\.\d+)?)\s*[xX*]\s*(\d+(?:\.\d+)?)/);
+    if (dimMatch) {
+      const w = parseFloat(dimMatch[1]);
+      const h = parseFloat(dimMatch[2]);
+      if (w > 0.2 && h > 0.2) return { width: w, height: h };
+    }
+
+    if (/sot-?23/i.test(pkg)) return { width: 2.9, height: 1.6 };
+    if (/sot-?89/i.test(pkg)) return { width: 4.5, height: 2.5 };
+    if (/sot-?223/i.test(pkg)) return { width: 6.5, height: 3.5 };
+    if (/soic-?8|so-?8/i.test(pkg)) return { width: 4.9, height: 3.9 };
+    if (/soic-?14/i.test(pkg)) return { width: 8.65, height: 3.9 };
+    if (/soic-?16/i.test(pkg)) return { width: 9.9, height: 3.9 };
+    if (/sop-?4|so-?4|optocoupler|pc8|ltv|vishay/i.test(pkg)) return { width: 4.6, height: 6.5 };
+    if (/qfn|qfp/i.test(pkg)) return { width: 5.0, height: 5.0 };
+    if (/sma|do-?214ac/i.test(pkg)) return { width: 4.5, height: 2.6 };
+    if (/smb|do-?214aa/i.test(pkg)) return { width: 5.4, height: 3.6 };
+  }
+
+  // 5. Direct width/height — clamp so a bad value cannot span neighboring parts
+  if (typeof comp.width === 'number' && comp.width > 0.2 && typeof comp.height === 'number' && comp.height > 0.2) {
+    const maxLong = (comp.padCount || 1) <= 1 ? 3.2 : (comp.padCount <= 4 ? 8.0 : 12.0);
+    let w = comp.width, h = comp.height;
+    const long = Math.max(w, h);
+    if (long > maxLong) {
+      const scale = maxLong / long;
+      w *= scale; h *= scale;
+    }
+    return { width: w, height: h };
+  }
+
+  // 6. Mild designator fallback only when size is completely unknown (keep compact)
+  const id = String(comp.id || comp.componentIdentifier || '').toUpperCase();
+  if (/^VO?\d+/i.test(id) || /^U\d+/i.test(id)) return { width: 3.8, height: 4.6 };
+  if (/^Q\d+/i.test(id)) return { width: 2.9, height: 1.6 };
+
+  return { width: 2.0, height: 1.25 };
+}
+
+/**
+ * Generates outer boundary offsets [{dx, dy}, ...] relative to the component center point (0, 0).
+ * Closing vertex is included so traversing the points forms a closed perimeter loop around the component outline.
+ * Multi-pad parts: outline follows the copper pad-cluster AABB (one component, edges only).
+ */
+export function getComponentBoundaryOffsets(comp, options = {}) {
+  const { margin = 0 } = options; // flush to body — oversized boxes were covering neighbors
+
+  // Prefer real pad-cluster geometry when available (VO1 / Q1 / multi-pin)
+  const members = comp.memberPads || comp.pads;
+  if (Array.isArray(members) && members.length >= 2 && typeof comp.x === 'number' && typeof comp.y === 'number') {
+    const bbox = computePadsBoundingBox(members);
+    if (bbox) {
+      const hw = bbox.width / 2 + margin;
+      const hh = bbox.height / 2 + margin;
+      // Offset AABB centre vs component mid (PnP mid may differ slightly)
+      const ox = bbox.x - comp.x;
+      const oy = bbox.y - comp.y;
+      return [
+        { dx: ox - hw, dy: oy - hh },
+        { dx: ox + hw, dy: oy - hh },
+        { dx: ox + hw, dy: oy + hh },
+        { dx: ox - hw, dy: oy + hh },
+        { dx: ox - hw, dy: oy - hh },
+      ];
+    }
+  }
+
+  const { width: rawW, height: rawH } = getComponentDimensions(comp);
+  const w = Math.max(0.4, rawW + margin * 2);
+  const h = Math.max(0.4, rawH + margin * 2);
+
+  const angleRad = ((comp.rotation || 0) * Math.PI) / 180;
+  const cos = Math.cos(angleRad), sin = Math.sin(angleRad);
+  const rot = (dx, dy) => ({ dx: dx * cos - dy * sin, dy: dx * sin + dy * cos });
+
+  const shape = (comp.shape || '').toLowerCase();
+  if (shape === 'circle' || shape === 'c') {
+    const radius = Math.max(w, h) / 2;
+    const numSteps = 16;
+    const pts = [];
+    for (let i = 0; i <= numSteps; i++) {
+      const theta = (2 * Math.PI * i) / numSteps;
+      pts.push({
+        dx: radius * Math.cos(theta),
+        dy: radius * Math.sin(theta)
+      });
+    }
+    return pts;
+  }
+
+  // Rectangular outer boundary: 4 corners + closing back to first corner
+  const hw = w / 2;
+  const hh = h / 2;
+  return [
+    rot(-hw, -hh), // Corner 1
+    rot(+hw, -hh), // Corner 2
+    rot(+hw, +hh), // Corner 3
+    rot(-hw, +hh), // Corner 4
+    rot(-hw, -hh)  // Closed perimeter back to Corner 1
+  ];
+}
+
+export function calculatePerimeterLength(boundaryOffsets) {
+  if (!boundaryOffsets || boundaryOffsets.length < 2) return 0;
+  let total = 0;
+  for (let i = 0; i < boundaryOffsets.length - 1; i++) {
+    const p1 = boundaryOffsets[i];
+    const p2 = boundaryOffsets[i + 1];
+    total += Math.hypot(p2.dx - p1.dx, p2.dy - p1.dy);
+  }
+  return total;
 }
 
 export function getComponentDotOffsets(comp, spacingMm, customPatterns = {}) {
-  const pattern = customPatterns[comp.id] || classifyDotPattern(comp.pkg);
-  const half = spacingMm / 2, angleRad = ((comp.rotation || 0) * Math.PI) / 180;
-  const cos = Math.cos(angleRad), sin = Math.sin(angleRad);
-  const rot = (dx, dy) => ({ dx: dx * cos - dy * sin, dy: dx * sin + dy * cos });
-  if (pattern === 'dual') return [rot(-half, 0), rot(half, 0)];
-  if (pattern === 'quad') return [rot(-half, -half), rot(half, -half), rot(half, half), rot(-half, half)];
-  return [{ dx: 0, dy: 0 }];
+  // Backward compatibility: delegates to outer boundary
+  return getComponentBoundaryOffsets(comp);
 }
 
 export function detectPanelFromFiducials(fiducials) {

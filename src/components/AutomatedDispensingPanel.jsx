@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { useToast } from '../Toast.jsx';
-import { dispensePoint, dispenseBead } from "../lib/motion/gcode.js";
+import { clampFeedXY, clampFeedZ, jogRel, SAFE_FEEDS } from "../lib/motion/gcode.js";
 import { applyTransform, fitSimilarity, fitAffine } from "../lib/utils/transform2d.js";
 import { fw, parseGrblStatus } from '../lib/firmware/grblCommands.js';
 import "./AutomatedDispensingPanel.css";
@@ -11,8 +11,8 @@ import { NozzleMaintenanceManager } from '../lib/maintenance/nozzleMaintenance.j
 import MaintenanceManager from './MaintenanceManager.jsx';
 import {
   SPC_KEY, spcLoad, spcAppend, parsePnpCsv,
-  detectDnpComponents, autoComputePnpOffset, classifyDotPattern,
-  getComponentDotOffsets, detectPanelFromFiducials,
+  detectDnpComponents, autoComputePnpOffset, getComponentBoundaryOffsets, getComponentDimensions, calculatePerimeterLength,
+  detectPanelFromFiducials, groupPadsIntoComponents, computePadsBoundingBox,
   nearestNeighborSort, totalTravelMm, Sparkline,
 } from './dispensingHelpers.jsx';
 
@@ -56,6 +56,7 @@ export default function AutomatedDispensingPanel({
   tipCleanerManager,
   tipRotationManager,
   motionManager = null,
+  pads = [],
 }) {
   const toast = useToast();
   const [isJobRunning, setIsJobRunning] = useState(false);
@@ -95,14 +96,53 @@ export default function AutomatedDispensingPanel({
     : { x: 0, y: 0 };
 
   // Machine Configuration State
-  const [valveOnCmd, setValveOnCmd] = useState(fw.dispenserOn(255));
-  const [valveOffCmd, setValveOffCmd] = useState(fw.dispenserOff);
+  const [valveOnCmd, setValveOnCmd] = useState(() => localStorage.getItem('dispenser_valveOnCmd') || 'M8');
+  const [valveOffCmd, setValveOffCmd] = useState(() => localStorage.getItem('dispenser_valveOffCmd') || 'M9');
   const [dispenseHeight, setDispenseHeight] = useState(0.5);
   const [safeTravelHeight, setSafeTravelHeight] = useState(5.0);
+  const [localToolOffset, setLocalToolOffset] = useState(() => {
+    try {
+      const stored = localStorage.getItem('toolOffset');
+      return stored ? JSON.parse(stored) : (toolOffset || { dx: 0, dy: 0 });
+    } catch {
+      return toolOffset || { dx: 0, dy: 0 };
+    }
+  });
+
+  useEffect(() => {
+    if (toolOffset && (toolOffset.dx !== undefined || toolOffset.dy !== undefined)) {
+      setLocalToolOffset(toolOffset);
+    }
+  }, [toolOffset]);
+
+  const updateToolOffset = (newOffset) => {
+    setLocalToolOffset(newOffset);
+    try {
+      localStorage.setItem('toolOffset', JSON.stringify(newOffset));
+      localStorage.setItem('nozzleMaintenance_toolOffset', JSON.stringify(newOffset));
+      window.dispatchEvent(new Event('storage'));
+    } catch {}
+  };
+
+  useEffect(() => {
+    const handleStorageChange = () => {
+      try {
+        const stored = localStorage.getItem('toolOffset') || localStorage.getItem('nozzleMaintenance_toolOffset');
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          if (parsed && (parsed.dx !== undefined || parsed.dy !== undefined)) {
+            setLocalToolOffset(parsed);
+          }
+        }
+      } catch {}
+    };
+    window.addEventListener('storage', handleStorageChange);
+    return () => window.removeEventListener('storage', handleStorageChange);
+  }, []);
   const [viscosity, setViscosity] = useState('medium'); // low, medium, high
   const [baseDwellTime, setBaseDwellTime] = useState(120);
   const [beadAreaThreshold, setBeadAreaThreshold] = useState(2.0); // mm² — pads above this use bead mode
-  const [beadFeedRate, setBeadFeedRate] = useState(500);           // mm/min while sweeping the bead
+  const [beadFeedRate, setBeadFeedRate] = useState(SAFE_FEEDS.dispenseXY); // mm/min outline/bead (≤ GRBL Y max)
   const [localPressure, setLocalPressure] = useState(() => pressureSettings?.customPressure || 25);
   const [pwmDuty, setPwmDuty] = useState(255);
   const [currentPadInfo, setCurrentPadInfo] = useState(null);
@@ -160,8 +200,8 @@ export default function AutomatedDispensingPanel({
   const [dryRunMode, setDryRunMode] = useState(() => {
     try {
       const v = localStorage.getItem('dryRunMode');
-      return v !== null ? v === 'true' : true; // Default true so testing is always safe
-    } catch { return true; }
+      return v !== null ? v === 'true' : false; // Default false so real dispensing jobs fire the valve!
+    } catch { return false; }
   });
   useEffect(() => { localStorage.setItem('dryRunMode', String(dryRunMode)); }, [dryRunMode]);
 
@@ -241,14 +281,48 @@ export default function AutomatedDispensingPanel({
     ? (pnpSideFilter === 'all' ? pnpComponents : pnpComponents.filter(c => c.side === pnpSideFilter))
     : [];
 
-  // Active components only — drives the actual job
-  const filteredPnpComponents = sideFilteredComponents
-    .filter(c => !pnpExcluded.has(c.id))
-    .map(c => ({
-      ...c,
-      x: c.x + pnpOffsetX,
-      y: (pnpFlipY ? -c.y : c.y) + pnpOffsetY,
-    }));
+  // Gerber pads grouped by refdes — used to size PnP outlines from real copper extents
+  const gerberComponentsById = useMemo(() => {
+    const map = new Map();
+    try {
+      for (const g of groupPadsIntoComponents(pads || [])) {
+        const key = String(g.componentIdentifier || g.id || '').toUpperCase();
+        if (key) map.set(key, g);
+      }
+    } catch { /* ignore */ }
+    return map;
+  }, [pads]);
+
+  // Active components only — drives the actual job (one outline per component)
+  const filteredPnpComponents = useMemo(() => {
+    return sideFilteredComponents
+      .filter(c => !pnpExcluded.has(c.id))
+      .map(c => {
+        const key = String(c.id || c.componentIdentifier || '').toUpperCase();
+        const gerber = gerberComponentsById.get(key);
+        const base = {
+          ...c,
+          pkg: c.pkg || c.footprint,
+          footprint: c.footprint || c.pkg,
+          x: c.x + pnpOffsetX,
+          y: (pnpFlipY ? -c.y : c.y) + pnpOffsetY,
+        };
+        if (gerber && gerber.padCount >= 2) {
+          const bbox = computePadsBoundingBox(gerber.memberPads);
+          if (bbox) {
+            return {
+              ...base,
+              width: bbox.width,
+              height: bbox.height,
+              memberPads: gerber.memberPads,
+              padCount: gerber.padCount,
+              centerMethod: 'pnp_csv+gerber_bbox',
+            };
+          }
+        }
+        return base;
+      });
+  }, [sideFilteredComponents, pnpExcluded, pnpOffsetX, pnpOffsetY, pnpFlipY, gerberComponentsById]);
 
   // Nearest-neighbor reorder of active components (same set, cheaper travel path)
   const optimizedPnpComponents = useMemo(() => {
@@ -366,12 +440,8 @@ export default function AutomatedDispensingPanel({
     return next;
   });
 
-  // Total individual glue dots across all active PnP components (accounts for dual/quad patterns)
-  const totalPnpDots = isPnpMode
-    ? filteredPnpComponents.reduce(
-      (sum, c) => sum + getComponentDotOffsets(c, dotSpacingMm, customDotPatterns).length, 0
-    )
-    : 0;
+  // Total components to outline across all active PnP components
+  const totalPnpDots = isPnpMode ? filteredPnpComponents.length : 0;
 
   // Refs for async access
   const xfRef = useRef(xf);
@@ -661,8 +731,41 @@ export default function AutomatedDispensingPanel({
     }
   };
 
+  /**
+   * Send glue valve ON/OFF to Arduino Mega (983A on digital pin 8 via GRBL M8/M9).
+   * Does NOT wait for GRBL 'ok' — fire-and-forget so the job never stalls.
+   */
+  const sendValveSignal = async (cmd, stateLabel) => {
+    const c = String(cmd || '').trim();
+    const serialOk = !!(window.serial && window.serial.writeLine);
+    console.log(
+      `%c[GLUE VALVE ${stateLabel}]`,
+      stateLabel === 'ON' ? 'color:#00c853;font-weight:bold' : 'color:#ff5252;font-weight:bold',
+      `| cmd="${c}" | serialConnected=${serialOk} | pin=D8 (M8=HIGH / M9=LOW) | t=${new Date().toISOString()}`
+    );
+    if (!c) {
+      console.error(`[GLUE VALVE ${stateLabel}] ABORTED — empty command (check Valve ON/OFF fields)`);
+      return false;
+    }
+    if (!serialOk) {
+      console.error(`[GLUE VALVE ${stateLabel}] ABORTED — window.serial.writeLine missing (not connected?)`);
+      toast.error(`Glue valve ${stateLabel} not sent — serial disconnected`);
+      return false;
+    }
+    try {
+      await window.serial.writeLine(c);
+      console.log(`[GLUE VALVE ${stateLabel}] ✓ writeLine("${c}") sent to Arduino Mega`);
+      await new Promise(r => setTimeout(r, 120));
+      return true;
+    } catch (err) {
+      console.error(`[GLUE VALVE ${stateLabel}] ✗ writeLine FAILED:`, err?.message || err);
+      toast.error(`Glue valve ${stateLabel} failed: ${err?.message || err}`);
+      return false;
+    }
+  };
+
   // Actively commands machine to target X/Y coordinates and waits until physical arrival
-  const moveCameraToTarget = async (targetX, targetY, feed = 400) => {
+  const moveCameraToTarget = async (targetX, targetY, feed = SAFE_FEEDS.travelXY) => {
     const curPos = machinePositionRef.current || { x: 0, y: 0 };
     const dist = Math.hypot(targetX - curPos.x, targetY - curPos.y);
     const transitMs = Math.ceil((dist / (feed / 60)) * 1000);
@@ -705,7 +808,7 @@ export default function AutomatedDispensingPanel({
   };
 
   // Actively commands machine along Z axis and waits until physical arrival
-  const moveZAndWait = async (targetZ, feed = 300) => {
+  const moveZAndWait = async (targetZ, feed = SAFE_FEEDS.z) => {
     const curPos = machinePositionRef.current || { x: 0, y: 0, z: 0 };
     const dist = Math.abs(targetZ - (curPos.z ?? 0));
     const transitMs = Math.ceil((dist / (feed / 60)) * 1000);
@@ -1222,14 +1325,14 @@ export default function AutomatedDispensingPanel({
           if (probeTarget) {
             const cx = probeTarget.x + (toolOffset?.dx || 0) + calibCorrection.x;
             const cy = probeTarget.y + (toolOffset?.dy || 0) + calibCorrection.y;
-            await sendGcodeWait(`G1 X${cx.toFixed(3)} Y${cy.toFixed(3)} F400`);
+            await sendGcodeWait(`G1 X${cx.toFixed(3)} Y${cy.toFixed(3)} F300`);
             await sendGcodeWait('G4 P0.01'); // Force GRBL planner sync
             await new Promise(r => setTimeout(r, 300));
           }
         }
         const probeOk = await probeZSurface();
         setProbeResult(probeOk ? 'contact' : 'no-contact');
-        await sendGcodeWait(`G1 Z${safeTravelHeight} F400`); // retract
+        await sendGcodeWait(`G1 Z${safeTravelHeight} F300`); // retract
         if (!probeOk) {
           console.log('[SurfaceProbe] Skipped — running with operator-set Z reference.');
         }
@@ -1261,7 +1364,7 @@ export default function AutomatedDispensingPanel({
           for (let f of solvedFiducials) {
             if (!isJobRunningRef.current) throw new Error("Job Aborted");
             const expectedMachine = applyTransform(transform, f.design);
-            await sendGcodeWait(`G1 Z${safeTravelHeight} F400`);
+            await sendGcodeWait(`G1 Z${safeTravelHeight} F300`);
             const fidTravelSpeed = 400;
             await sendGcodeWait(`G1 X${expectedMachine.x.toFixed(3)} Y${expectedMachine.y.toFixed(3)} F${fidTravelSpeed}`);
             await sendGcodeWait('G4 P0.01'); // Force GRBL planner sync
@@ -1408,9 +1511,14 @@ export default function AutomatedDispensingPanel({
           p = { ...p, x: p.x - ox + boardOffX, y: p.y - oy + boardOffY };
         }
 
-        // ─── APPLY CALIBRATION CORRECTION (same as "Move Camera Here") ──────
-        const finalX = p.x + calibCorrection.x;
-        const finalY = p.y + calibCorrection.y;
+        // In real dispensing, apply physical nozzle-to-camera offset so the needle lands on the component!
+        // In dry run, camera points at the component so offset is 0.
+        const offX = dryRunMode ? 0 : (localToolOffset?.dx || 0);
+        const offY = dryRunMode ? 0 : (localToolOffset?.dy || 0);
+
+        // ─── APPLY CALIBRATION CORRECTION AND TOOL OFFSET ──────
+        const finalX = p.x + calibCorrection.x + offX;
+        const finalY = p.y + calibCorrection.y + offY;
 
         // Soft axis limits guard — abort job if this pad is outside travel envelope
         const zWork = dispenseHeight + getZOffsetForPoint(finalX, finalY);
@@ -1437,25 +1545,18 @@ export default function AutomatedDispensingPanel({
             const boardOffY = isPnpPanel && board.offsetY != null ? board.offsetY : 0;
             mx = dp.x - ox + boardOffX; my = dp.y - oy + boardOffY;
           }
-          return { finalX: mx + calibCorrection.x, finalY: my + calibCorrection.y };
+          return { finalX: mx + calibCorrection.x + offX, finalY: my + calibCorrection.y + offY };
         };
 
-        // Dot offsets in design space — [{dx, dy}].  Single-dot = [{0,0}] (Gerber + 1-dot PnP).
-        const dotOffsets = isPnpMode
-          ? getComponentDotOffsets(seq[seqIdx], dotSpacingMm, customDotPatterns)
-          : [{ dx: 0, dy: 0 }];
+        // Component outer boundary offsets in design space — [{dx, dy}, ...]
+        const boundaryOffsets = getComponentBoundaryOffsets(seq[seqIdx]);
+        const compDims = getComponentDimensions(seq[seqIdx]);
+        const perimeterMm = calculatePerimeterLength(boundaryOffsets);
 
-        let pressure, dwell, dispenseMode;
-        if (isPnpMode) {
-          pressure = localPressure;
-          dwell = baseDwellTime;
-          dispenseMode = { mode: 'dot' };
-        } else {
-          const configDwell = pressureSettings.customDwellTime || baseDwellTime;
-          pressure = dispensingSequencer.calculatePadPressure(p, { customPressure: localPressure });
-          dwell = dispensingSequencer.calculateDwellTime(p, { customDwellTime: configDwell });
-          dispenseMode = dispensingSequencer.selectDispenseMode(p, { beadAreaThreshold });
-        }
+        let pressure, dwell;
+        const configDwell = pressureSettings.customDwellTime || baseDwellTime;
+        pressure = isPnpMode ? localPressure : dispensingSequencer.calculatePadPressure(p, { customPressure: localPressure });
+        dwell = isPnpMode ? baseDwellTime : dispensingSequencer.calculateDwellTime(p, { customDwellTime: configDwell });
 
         const padVolUl = isPnpMode ? glueDotVolUl : (glueSummary?.annotated?.[globalPointCount - 1]?.glue?.volUl ?? 0);
         setCurrentPadInfo({
@@ -1464,10 +1565,12 @@ export default function AutomatedDispensingPanel({
           pressure,
           dwellMs: dwell,
           volumeUl: padVolUl.toFixed ? padVolUl.toFixed(3) : '—',
-          mode: dispenseMode.mode,
+          mode: 'outline',
+          outlineDims: `${compDims.width.toFixed(2)}×${compDims.height.toFixed(2)} mm`,
+          perimeterMm: perimeterMm.toFixed(2),
         });
 
-        // Accumulate log entry for this pad
+        // Accumulate log entry for this component
         padLogRef.current.push({
           padIndex: globalPointCount,
           padId: p.id || p.componentIdentifier || `P${globalPointCount}`,
@@ -1478,13 +1581,22 @@ export default function AutomatedDispensingPanel({
           volumeUl: padVolUl.toFixed ? padVolUl.toFixed(4) : '0',
           dotPassed: null,
           dotDiameter_mm: '',
+          outline: `${compDims.width.toFixed(2)}×${compDims.height.toFixed(2)} mm`,
+          perimeterMm: perimeterMm.toFixed(2),
+        });
+
+        // Map component outer boundary offsets to final machine coordinates
+        const boundaryPoints = boundaryOffsets.map(bo => {
+          const { finalX: bx, finalY: by } = designToFinalXY(bo.dx, bo.dy);
+          return { x: bx, y: by };
         });
 
         if (dryRunMode) {
-          // ── Camera Alignment Verification (Dry Run Mode) ────────────────────
-          // Centers camera crosshair directly over component centroid at current working height (no dispensing)
+          // ── Dry-run motion (unchanged) + glue valve ON/OFF for 983A on Mega D8 ──
           setJobStage('dispensing');
-          const inspectSpeed = 400; // Smooth 400 mm/min inspection travel speed
+          const inspectSpeed = SAFE_FEEDS.travelXY;
+          const onCmd = (valveOnCmd || 'M8').trim();
+          const offCmd = (valveOffCmd || 'M9').trim();
 
           setCurrentPadInfo({
             padIndex: globalPointCount,
@@ -1492,56 +1604,42 @@ export default function AutomatedDispensingPanel({
             padId: p.id || p.componentIdentifier || `P${globalPointCount}`,
             x: finalX.toFixed(3),
             y: finalY.toFixed(3),
-            mode: 'camera-verify'
+            mode: 'boundary-verify',
+            outlineDims: `${compDims.width.toFixed(2)}×${compDims.height.toFixed(2)} mm`,
+            perimeterMm: perimeterMm.toFixed(2),
           });
 
-          console.log(`[Camera Alignment] Pointing camera at Pad ${globalPointCount}/${totalPoints}: (X${finalX.toFixed(3)}, Y${finalY.toFixed(3)})`);
+          console.log(`[DryRun+Valve] Comp ${globalPointCount}/${totalPoints} @ (X${finalX.toFixed(3)}, Y${finalY.toFixed(3)}) | valveOn=${onCmd} valveOff=${offCmd}`);
+
           // 1. Move XY to component center at safe travel height
           await moveCameraToTarget(finalX, finalY, inspectSpeed);
 
-          // 2. Optical Auto-Centering (vision servo snaps to component centroid)
+          // 2. Optical Auto-Centering (vision servo snaps to THIS component only)
           if (dryRunAutoCenter) {
             try {
-              // Settle time for gantry vibration & camera stream stability
               await new Promise(r => setTimeout(r, 250));
-              const res = await fetch('http://localhost:8000/api/find_component_center', { method: 'POST' });
+              const expQ = `expected_width_mm=${compDims.width}&expected_height_mm=${compDims.height}`;
+              const res = await fetch(`http://localhost:8000/api/find_component_center?${expQ}`, { method: 'POST' });
               if (res.ok) {
                 const data = await res.json();
                 if (data.found && data.offset_dx !== undefined && data.offset_dy !== undefined) {
+                  const expDiag = Math.hypot(compDims.width, compDims.height);
+                  const detDiag = Math.hypot(data.boundary_w_mm || 0, data.boundary_h_mm || 0);
+                  const mergedNeighbors = expDiag > 0.3 && detDiag > expDiag * 1.75;
                   let dist = Math.hypot(data.offset_dx, data.offset_dy);
-                  if (dist > 0.015 && dist < 6.0) {
+                  if (mergedNeighbors) {
+                    console.warn(`[Camera Alignment] Skipping auto-center for ${p.id || globalPointCount}: vision outline ${detDiag.toFixed(2)}mm spans neighbors (expected ${expDiag.toFixed(2)}mm)`);
+                  } else if (dist > 0.015 && dist < Math.max(4.0, expDiag)) {
                     console.log(`[Camera Alignment] Auto-centering component ${p.id || globalPointCount} (${data.comp_type || 'component'}): ΔX:${data.offset_dx >= 0 ? '+' : ''}${data.offset_dx} ΔY:${data.offset_dy >= 0 ? '+' : ''}${data.offset_dy} mm`);
                     const cmds = jogRel({ dx: data.offset_dx, dy: data.offset_dy, feed: 150 });
                     for (const line of cmds) {
-                      await sendGcodeWait(line, 4000);
+                      await window.serial.writeLine(line);
+                      await new Promise(r => setTimeout(r, 40));
                     }
-                    await sendGcodeWait('G4 P0.05', 4000);
+                    await new Promise(r => setTimeout(r, 250));
                     if (window.serial?.write) await window.serial.write('?');
                     await new Promise(r => setTimeout(r, 200));
-
-                    // Micro-refinement pass for larger corrections (>0.12mm) to guarantee sub-0.02mm centering
-                    if (dist > 0.12) {
-                      try {
-                        const refRes = await fetch('http://localhost:8000/api/find_component_center', { method: 'POST' });
-                        if (refRes.ok) {
-                          const refData = await refRes.json();
-                          if (refData.found && refData.offset_dx !== undefined && refData.offset_dy !== undefined) {
-                            const refDist = Math.hypot(refData.offset_dx, refData.offset_dy);
-                            if (refDist > 0.02 && refDist < 0.35) {
-                              console.log(`[Camera Alignment] Fine micro-refinement: ΔX:${refData.offset_dx >= 0 ? '+' : ''}${refData.offset_dx} ΔY:${refData.offset_dy >= 0 ? '+' : ''}${refData.offset_dy} mm`);
-                              const refCmds = jogRel({ dx: refData.offset_dx, dy: refData.offset_dy, feed: 100 });
-                              for (const line of refCmds) await sendGcodeWait(line, 3000);
-                              await sendGcodeWait('G4 P0.03', 3000);
-                            }
-                          }
-                        }
-                      } catch {}
-                    }
-                  } else {
-                    console.log(`[Camera Alignment] Component ${p.id || globalPointCount} already centered (residual: ${dist.toFixed(3)}mm)`);
                   }
-                } else {
-                  console.log(`[Camera Alignment] Component center scan: ${data.error || 'no distinct pads found'}`);
                 }
               }
             } catch (err) {
@@ -1549,77 +1647,65 @@ export default function AutomatedDispensingPanel({
             }
           }
 
-          // 3. Lower Z down to component inspection height if requested
+          // 3. Lower Z before opening valve (so 983A dispenses at work height)
           if (dryRunLowerZ) {
+            console.log(`[DryRun+Valve] Lowering Z to ${zWork} before valve ON`);
             await moveZAndWait(zWork, 250);
           }
 
-          // 4. Pause for 1.5s so operator can clearly verify camera crosshair alignment in video feed
-          await new Promise(r => setTimeout(r, 1500));
+          // 4. Valve ON (M8 → Mega D8 HIGH → 983A / air compressor dispense)
+          console.log(`[DryRun+Valve] >>> opening glue valve for component ${globalPointCount}`);
+          await sendValveSignal(onCmd, 'ON');
 
-          // 5. Retract Z back to safe travel height before traversing to next component
+          // 5. Trace outer boundary while valve is HIGH
+          try {
+            for (let vi = 0; vi < boundaryPoints.length; vi++) {
+              const bp = boundaryPoints[vi];
+              await moveCameraToTarget(bp.x, bp.y, inspectSpeed);
+              if (vi === 0) await new Promise(r => setTimeout(r, 300));
+            }
+            await new Promise(r => setTimeout(r, 200));
+          } finally {
+            // 6. Valve OFF (M9 → Mega D8 LOW) — always, even if motion aborts
+            console.log(`[DryRun+Valve] <<< closing glue valve for component ${globalPointCount}`);
+            await sendValveSignal(offCmd, 'OFF');
+          }
+
+          // 7. Retract Z
           if (dryRunLowerZ) {
             await moveZAndWait(safeTravelHeight, 300);
           }
-        } else if (dotOffsets.length === 1) {
-          // ── Single-dot path — unchanged behaviour (Gerber pads + 1-dot PnP) ──
-          let cmds;
-          const activeSpeedMmMin = (motionManager?.getActiveSettings()?.speed || 100) * 60;
-          const activeZSpeedMmMin = Math.min(activeSpeedMmMin * 0.2, 500);
+        } else {
+          // ── Outer Boundary / Outline Dispensing for Component ──
+          // motionManager speed is mm/s — convert then hard-clamp to GRBL-safe feeds
+          const profileMmMin = (motionManager?.getActiveSettings()?.speed || 5) * 60;
+          const activeSpeedMmMin = clampFeedXY(profileMmMin, SAFE_FEEDS.travelXY);
+          const activeZSpeedMmMin = clampFeedZ(Math.min(activeSpeedMmMin * 0.7, SAFE_FEEDS.z), SAFE_FEEDS.z);
+          const activeDispenseSpeed = clampFeedXY(beadFeedRate || SAFE_FEEDS.dispenseXY, SAFE_FEEDS.dispenseXY);
 
-          if (dispenseMode.mode === 'bead') {
-            cmds = dispenseBead({
-              x: finalX, y: finalY,
-              beadLength: dispenseMode.length,
-              beadAxis: dispenseMode.axis,
-              zWork,
-              zSafe: safeTravelHeight,
-              feedXY: activeSpeedMmMin,
-              feedZ: activeZSpeedMmMin,
-              feedBead: beadFeedRate,
-              pressure,
-              pwmDuty,
-            });
-          } else {
-            cmds = dispensePoint({
-              x: finalX, y: finalY,
-              zWork,
-              zSafe: safeTravelHeight,
-              feedXY: activeSpeedMmMin,
-              feedZ: activeZSpeedMmMin,
-              pressure,
-              dwellMs: dwell,
-              pwmDuty,
-            });
+          // Verify all boundary points are within soft axis limits
+          for (const bp of boundaryPoints) {
+            assertInBounds(bp.x, bp.y, zWork, `comp ${globalPointCount} boundary`);
           }
+
+          const cmds = dispenseOutline({
+            boundaryPoints,
+            zWork,
+            zSafe: safeTravelHeight,
+            feedXY: activeSpeedMmMin,
+            feedZ: activeZSpeedMmMin,
+            feedDispense: activeDispenseSpeed,
+            pressure,
+            pwmDuty,
+            valveOn: valveOnCmd || fw.dispenserOn(pwmDuty),
+            valveOff: valveOffCmd || fw.dispenserOff,
+          });
+
+          console.log(`[Outline Dispensing] Comp ${globalPointCount}: Executing outline (Valve ON: ${valveOnCmd || 'M8'}, Valve OFF: ${valveOffCmd || 'M9'})`, cmds);
           for (const c of cmds) await sendGcodeWait(c);
           nozzleMaintenance.recordDispense();
           fluxManager?.recordDispense();
           tipCleanerManager?.recordPadDispensed();
-        } else {
-          // ── Multi-dot path — PnP dual/quad pattern ───────────────────────────
-          const activeSpeedMmMin = (motionManager?.getActiveSettings()?.speed || 100) * 60;
-          const activeZSpeedMmMin = Math.min(activeSpeedMmMin * 0.2, 500);
-          
-          for (const dot of dotOffsets) {
-            const { finalX: dfx, finalY: dfy } = designToFinalXY(dot.dx, dot.dy);
-            const dotZWork = dispenseHeight + getZOffsetForPoint(dfx, dfy);
-            assertInBounds(dfx, dfy, dotZWork, `pad ${globalPointCount} dot`);
-            const dotCmds = dispensePoint({
-              x: dfx, y: dfy,
-              zWork: dotZWork,
-              zSafe: safeTravelHeight,
-              feedXY: activeSpeedMmMin,
-              feedZ: activeZSpeedMmMin,
-              pressure,
-              dwellMs: dwell,
-              pwmDuty,
-            });
-            for (const c of dotCmds) await sendGcodeWait(c);
-            nozzleMaintenance.recordDispense();
-            fluxManager?.recordDispense();
-            tipCleanerManager?.recordPadDispensed();
-          }
         }
 
         // ── Post-dispense dot verification (dispensing only, bypassed in camera test) ──
@@ -1678,7 +1764,7 @@ export default function AutomatedDispensingPanel({
         await moveZAndWait(safeTravelHeight, 300); // Retract to safe height
       }
       if (!dryRunMode) {
-        await sendGcodeWait('G1 X0 Y0 F400'); // Move to home position
+        await sendGcodeWait('G1 X0 Y0 F300'); // Move to home position
         await sendGcodeWait('G4 P0.01'); // Force GRBL planner sync // Wait for all moves to complete
       } else {
         toast.success(`Camera test complete! Verified all ${totalPoints} components.`);
@@ -1817,16 +1903,16 @@ export default function AutomatedDispensingPanel({
       const hasValidStation = station?.configured && Number.isFinite(station.x) && Number.isFinite(station.y) && station.x > 1 && station.y > 1;
       if (hasValidStation) {
         const liftZ = Math.max((station.z || 0) + 5, safeTravelHeight);
-        await sendGcodeWait(`G1 Z${liftZ.toFixed(3)} F400`);
-        await sendGcodeWait(`G1 X${station.x.toFixed(3)} Y${station.y.toFixed(3)} F400`);
-        await sendGcodeWait(`G1 Z${(station.z || 0).toFixed(3)} F400`);
+        await sendGcodeWait(`G1 Z${liftZ.toFixed(3)} F300`);
+        await sendGcodeWait(`G1 X${station.x.toFixed(3)} Y${station.y.toFixed(3)} F300`);
+        await sendGcodeWait(`G1 Z${(station.z || 0).toFixed(3)} F300`);
       } else {
         toast.warning('Purge station not configured — skipping purge.');
         return;
       }
       // Trigger dispenser valve ON (5s timeout)
       try {
-        await sendGcodeWait(fw.dispenserOn(255), 5000);
+        await sendGcodeWait(valveOnCmd || 'M8', 5000);
       } catch (e) {
         console.warn('[Purge] Dispenser ON warning:', e.message);
       }
@@ -1834,12 +1920,12 @@ export default function AutomatedDispensingPanel({
       await new Promise(r => setTimeout(r, Math.max(100, durationMs)));
       // Turn dispenser valve OFF (5s timeout)
       try {
-        await sendGcodeWait(fw.dispenserOff, 5000);
+        await sendGcodeWait(valveOffCmd || 'M9', 5000);
       } catch (e) {
         console.warn('[Purge] Dispenser OFF warning:', e.message);
       }
       if (hasValidStation) {
-        await sendGcodeWait(`G1 Z${safeTravelHeight.toFixed(3)} F400`);
+        await sendGcodeWait(`G1 Z${safeTravelHeight.toFixed(3)} F300`);
       }
     } finally {
       setIsPurging(false);
@@ -1909,8 +1995,11 @@ export default function AutomatedDispensingPanel({
       await window.serial.writeLine(fw.unlock);
       await new Promise(r => setTimeout(r, 100));
       await window.serial.writeLine(fw.dispenserOff);
+      if (valveOffCmd && valveOffCmd !== fw.dispenserOff) {
+        await window.serial.writeLine(valveOffCmd);
+      }
       await window.serial.writeLine(fw.relMode);
-      await window.serial.writeLine('G0 Z10 F400');
+      await window.serial.writeLine('G0 Z10 F300');
       await window.serial.writeLine(fw.absMode);
     } catch {
       // The stop command is best effort; the machine state is reset below.
@@ -1926,11 +2015,11 @@ export default function AutomatedDispensingPanel({
   // Applies the live calibration correction so the crosshair lands precisely on-center
   const moveCameraToMachineCoord = async (mx, my) => {
     if (!window.serial || !window.serial.writeLine) { toast.warning('Serial not connected'); return; }
-    const feed = 400; // Smooth inspection speed
+    const feed = SAFE_FEEDS.travelXY; // Smooth inspection speed
     const corrX = mx + calibCorrection.x;
     const corrY = my + calibCorrection.y;
     await window.serial.writeLine(fw.absMode);
-    await window.serial.writeLine(`G1 Z${safeTravelHeight} F400`);
+    await window.serial.writeLine(`G1 Z${safeTravelHeight} F300`);
     await window.serial.writeLine(`G1 X${corrX.toFixed(3)} Y${corrY.toFixed(3)} F${feed}`);
   };
 
@@ -2159,13 +2248,37 @@ export default function AutomatedDispensingPanel({
                 </select>
               </label>
               <label>
-                Valve ON Cmd:
-                <input type="text" value={valveOnCmd} onChange={e => setValveOnCmd(e.target.value)} style={{ width: '100%', marginTop: '4px' }} />
+                Valve ON Cmd (Pin 8 = M8):
+                <input type="text" value={valveOnCmd} onChange={e => { setValveOnCmd(e.target.value); localStorage.setItem('dispenser_valveOnCmd', e.target.value); }} style={{ width: '100%', marginTop: '4px' }} />
               </label>
               <label>
-                Valve OFF Cmd:
-                <input type="text" value={valveOffCmd} onChange={e => setValveOffCmd(e.target.value)} style={{ width: '100%', marginTop: '4px' }} />
+                Valve OFF Cmd (Pin 8 = M9):
+                <input type="text" value={valveOffCmd} onChange={e => { setValveOffCmd(e.target.value); localStorage.setItem('dispenser_valveOffCmd', e.target.value); }} style={{ width: '100%', marginTop: '4px' }} />
               </label>
+              <div style={{ gridColumn: '1 / -1', display: 'flex', gap: '8px', marginTop: '2px', marginBottom: '8px' }}>
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ background: '#238636', color: '#fff', fontSize: '0.82rem', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+                  onClick={async () => {
+                    const ok = await sendValveSignal(valveOnCmd || 'M8', 'ON');
+                    if (ok) toast.success(`Valve ON sent: ${valveOnCmd || 'M8'} — check 983A / pin 8`);
+                  }}
+                >
+                  ⚡ Test Valve ON ({valveOnCmd || 'M8'})
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ background: '#da3633', color: '#fff', fontSize: '0.82rem', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+                  onClick={async () => {
+                    const ok = await sendValveSignal(valveOffCmd || 'M9', 'OFF');
+                    if (ok) toast.info(`Valve OFF sent: ${valveOffCmd || 'M9'}`);
+                  }}
+                >
+                  ⏹ Test Valve OFF ({valveOffCmd || 'M9'})
+                </button>
+              </div>
               <label>
                 Dispense Z (mm):
                 <input type="number" step="0.1" value={dispenseHeight} onChange={e => setDispenseHeight(parseFloat(e.target.value))} style={{ width: '100%', marginTop: '4px' }} />
@@ -2174,6 +2287,60 @@ export default function AutomatedDispensingPanel({
                 Safe Travel Z (mm):
                 <input type="number" step="1" value={safeTravelHeight} onChange={e => setSafeTravelHeight(parseFloat(e.target.value))} style={{ width: '100%', marginTop: '4px' }} />
               </label>
+              <div style={{ gridColumn: '1 / -1', background: '#161b22', border: '1px solid #30363d', borderRadius: '6px', padding: '12px', marginTop: '6px', marginBottom: '6px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px', flexWrap: 'wrap', gap: '6px' }}>
+                  <span style={{ color: '#58a6ff', fontWeight: 600, fontSize: '0.88rem' }}>
+                    🎯 Camera-to-Nozzle Distance (Tool Offset)
+                  </span>
+                  {(!localToolOffset?.dx && !localToolOffset?.dy) ? (
+                    <span style={{ background: '#da3633', color: '#fff', fontSize: '0.72rem', padding: '2px 8px', borderRadius: '10px', fontWeight: 600 }}>
+                      ⚠️ Offset is (0,0) - Camera = Nozzle!
+                    </span>
+                  ) : (
+                    <span style={{ background: '#238636', color: '#fff', fontSize: '0.72rem', padding: '2px 8px', borderRadius: '10px', fontWeight: 600 }}>
+                      ✓ Offset Active (DX: {localToolOffset.dx} mm, DY: {localToolOffset.dy} mm)
+                    </span>
+                  )}
+                </div>
+                <div style={{ fontSize: '0.78rem', color: '#8b949e', marginBottom: '8px', lineHeight: '1.4' }}>
+                  Physical distance from the camera crosshair to the glue dispenser needle tip.
+                  During <strong>Real Dispensing</strong>, the gantry automatically offsets by these values so the <strong>glue needle lands precisely on component edges</strong>.
+                  In <strong>Dry Run Mode</strong>, offset is 0 so the camera looks directly at each component.
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                  <label style={{ fontSize: '0.82rem', margin: 0 }}>
+                    DX (X Offset in mm):
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={localToolOffset?.dx ?? 0}
+                      onChange={e => {
+                        const val = parseFloat(e.target.value) || 0;
+                        updateToolOffset({ ...localToolOffset, dx: val });
+                      }}
+                      style={{ width: '100%', marginTop: '3px', background: '#0d1117', border: '1px solid #30363d', color: '#fff', padding: '5px 8px', borderRadius: '4px' }}
+                    />
+                  </label>
+                  <label style={{ fontSize: '0.82rem', margin: 0 }}>
+                    DY (Y Offset in mm):
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={localToolOffset?.dy ?? 0}
+                      onChange={e => {
+                        const val = parseFloat(e.target.value) || 0;
+                        updateToolOffset({ ...localToolOffset, dy: val });
+                      }}
+                      style={{ width: '100%', marginTop: '3px', background: '#0d1117', border: '1px solid #30363d', color: '#fff', padding: '5px 8px', borderRadius: '4px' }}
+                    />
+                  </label>
+                </div>
+                {(!localToolOffset?.dx && !localToolOffset?.dy) && (
+                  <div style={{ marginTop: '8px', padding: '6px 8px', background: '#381a1a', border: '1px solid #da3633', borderRadius: '4px', fontSize: '0.76rem', color: '#f85149' }}>
+                    💡 <strong>Important:</strong> Offset is currently 0,0. If your needle is mounted alongside your camera, please type your measured distance here or use the <strong>📐 Camera-to-Nozzle Calibration Wizard</strong> in the sidebar/menu to calibrate it automatically!
+                  </div>
+                )}
+              </div>
               <label style={{ gridColumn: '1 / -1' }}>
                 <span style={{ color: '#f85149', fontWeight: 600 }}>⬛ Axis Limits (mm)</span>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, marginTop: 4 }}>
@@ -2246,7 +2413,7 @@ export default function AutomatedDispensingPanel({
               </label>
               <label>
                 Bead Speed (mm/min):
-                <input type="number" step="50" min="50" max="3000" value={beadFeedRate} onChange={e => setBeadFeedRate(Number(e.target.value))} style={{ width: '100%', marginTop: '4px' }} />
+                <input type="number" step="25" min="50" max={SAFE_FEEDS.maxXY} value={beadFeedRate} onChange={e => setBeadFeedRate(clampFeedXY(Number(e.target.value), SAFE_FEEDS.dispenseXY))} style={{ width: '100%', marginTop: '4px' }} />
               </label>
               {purgeEnabled && (
                 <label>
@@ -2919,14 +3086,16 @@ export default function AutomatedDispensingPanel({
                         <th style={{ padding: '4px 8px', borderBottom: '1px solid #30363d', color: '#8b949e' }}>X (mm)</th>
                         <th style={{ padding: '4px 8px', borderBottom: '1px solid #30363d', color: '#8b949e' }}>Y (mm)</th>
                         <th style={{ padding: '4px 8px', borderBottom: '1px solid #30363d', color: '#8b949e' }}>Side</th>
-                        <th style={{ padding: '4px 8px', borderBottom: '1px solid #30363d', color: '#ce93d8' }}>Dots</th>
-                        <th style={{ padding: '4px 8px', borderBottom: '1px solid #30363d', color: '#00c49a' }}>Vol (µL)</th>
+                        <th style={{ padding: '4px 8px', borderBottom: '1px solid #30363d', color: '#ce93d8' }}>Outline (W×H)</th>
+                        <th style={{ padding: '4px 8px', borderBottom: '1px solid #30363d', color: '#00c49a' }}>Perimeter</th>
                       </tr>
                     </thead>
                     <tbody>
                       {sideFilteredComponents.map(comp => {
                         const excluded = pnpExcluded.has(comp.id);
-                        const dotCount = getComponentDotOffsets(comp, dotSpacingMm, customDotPatterns).length;
+                        const compDim = getComponentDimensions(comp);
+                        const bOffsets = getComponentBoundaryOffsets(comp);
+                        const perim = calculatePerimeterLength(bOffsets);
                         return (
                           <tr key={comp.id}
                             style={{
@@ -2947,19 +3116,11 @@ export default function AutomatedDispensingPanel({
                             <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: '#58a6ff' }}>{comp.x.toFixed(3)}</td>
                             <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: '#58a6ff' }}>{comp.y.toFixed(3)}</td>
                             <td style={{ padding: '4px 8px', color: comp.side === 'bottom' ? '#ffa726' : '#e6edf3' }}>{comp.side}</td>
-                            <td style={{ padding: '4px 6px' }}>
-                              <select
-                                value={customDotPatterns[comp.id] || classifyDotPattern(comp.pkg)}
-                                onChange={e => setCustomDotPatterns(prev => ({ ...prev, [comp.id]: e.target.value }))}
-                                style={{ background: '#0d1117', border: '1px solid #30363d', color: dotCount > 1 ? '#ce93d8' : '#8b949e', fontSize: '0.8em', padding: '1px 3px', borderRadius: 3, cursor: 'pointer' }}
-                              >
-                                <option value="single">1×</option>
-                                <option value="dual">2×</option>
-                                <option value="quad">4×</option>
-                              </select>
+                            <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: '#ce93d8' }}>
+                              {compDim.width.toFixed(2)} × {compDim.height.toFixed(2)} mm
                             </td>
-                            <td style={{ padding: '4px 8px', color: excluded ? '#555' : '#00c49a' }}>
-                              {excluded ? '—' : (glueDotVolUl * dotCount).toFixed(3)}
+                            <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: excluded ? '#555' : '#00c49a' }}>
+                              {excluded ? '—' : `${perim.toFixed(2)} mm`}
                             </td>
                           </tr>
                         );
@@ -3062,10 +3223,10 @@ export default function AutomatedDispensingPanel({
               onChange={e => setDryRunMode(e.target.checked)}
               style={{ width: 18, height: 18, cursor: 'pointer' }}
             />
-            🎥 Camera Alignment Test (Dry Run — No Dispensing)
+            🎥 Dry Run + Glue Valve (983A / Mega D8)
           </label>
           <span style={{ fontSize: '0.82rem', marginLeft: 26, color: '#8b949e', lineHeight: 1.5 }}>
-            Safe camera testing mode: automatically moves the camera crosshair over the center of each component at safe travel height so you can verify positioning. Dispenser valves (M3/M5), purge, and Z touch probing are completely bypassed.
+            Same dry-run camera motion, plus real valve signal: <b>{valveOnCmd || 'M8'}</b> = ON/HIGH on pin 8 (983A dispenses), <b>{valveOffCmd || 'M9'}</b> = OFF/LOW. Watch console for <code>[GLUE VALVE ON/OFF]</code> logs during the job.
           </span>
           {dryRunMode && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginLeft: 26, marginTop: 4 }}>
@@ -3166,16 +3327,27 @@ export default function AutomatedDispensingPanel({
                 toast.success(`Captured center for ${pad.id || `Pad #${previewPadIdx + 1}`}: ΔX=${deltaX >= 0 ? '+' : ''}${deltaX.toFixed(3)}, ΔY=${deltaY >= 0 ? '+' : ''}${deltaY.toFixed(3)} mm`);
               };
 
+              const compDim = getComponentDimensions(pad);
+              const bOffsets = getComponentBoundaryOffsets(pad);
+              const perim = calculatePerimeterLength(bOffsets);
+
               const handleAutoCenter = async () => {
                 if (!isConnected) { toast.warning('Machine not connected'); return; }
                 toast.info('Scanning component pads via camera...');
                 try {
-                  const res = await fetch('http://localhost:8000/api/find_component_center', { method: 'POST' });
+                  const expQ = `expected_width_mm=${compDim.width}&expected_height_mm=${compDim.height}`;
+                  const res = await fetch(`http://localhost:8000/api/find_component_center?${expQ}`, { method: 'POST' });
                   if (res.ok) {
                     const data = await res.json();
                     if (data.found && data.offset_dx !== undefined && data.offset_dy !== undefined) {
                       const dist = Math.hypot(data.offset_dx, data.offset_dy);
-                      if (dist > 0.02 && dist < 4.0) {
+                      const expDiag = Math.hypot(compDim.width, compDim.height);
+                      const detDiag = Math.hypot(data.boundary_w_mm || 0, data.boundary_h_mm || 0);
+                      if (expDiag > 0.3 && detDiag > expDiag * 1.75) {
+                        toast.warning(`Vision locked onto neighboring parts (${detDiag.toFixed(1)}mm). Re-center camera on this component and retry.`);
+                        return;
+                      }
+                      if (dist > 0.02 && dist < Math.max(4.0, expDiag)) {
                         const cmds = jogRel({ dx: data.offset_dx, dy: data.offset_dy, feed: 150 });
                         for (const line of cmds) {
                           await sendGcodeWait(line, 4000);
@@ -3221,13 +3393,31 @@ export default function AutomatedDispensingPanel({
                 }
               };
 
+              const handleTraceBoundary = async () => {
+                if (!isConnected || !machineCoord) return;
+                toast.info(`Tracing outer boundary of ${pad.id || 'component'} (${compDim.width.toFixed(1)}×${compDim.height.toFixed(1)}mm)...`);
+                // Transform each design-space corner through the fiducial/board transform
+                // so rotated boards still trace ONE component outline correctly.
+                for (const bo of bOffsets) {
+                  const cornerPad = { ...pad, x: pad.x + bo.dx, y: pad.y + bo.dy };
+                  const mc = getPadPredictedMachineCoord(cornerPad, bIdx);
+                  if (!mc) continue;
+                  await moveCameraToMachineCoord(mc.x + calibCorrection.x, mc.y + calibCorrection.y);
+                  await new Promise(r => setTimeout(r, 200));
+                }
+                toast.success('Outer boundary trace complete!');
+              };
+
               return (
                 <>
                   <div style={{ background: '#161b22', borderRadius: 6, padding: '8px 12px', marginBottom: 10, fontFamily: 'monospace', fontSize: '0.82em' }}>
                     <div style={{ color: '#8b949e', marginBottom: 4 }}>
-                      {pad.id ? `Component: ${pad.id} (${pad.pkg || 'centroid'})` : `Pad ${previewPadIdx + 1}`} · {previewPadIdx + 1} / {effectiveSequence.length}
+                      {pad.id ? `Component: ${pad.id} (${pad.pkg || 'outline'})` : `Pad ${previewPadIdx + 1}`} · {previewPadIdx + 1} / {effectiveSequence.length}
                     </div>
                     <div>Design: X<span style={{ color: '#79c0ff' }}>{pad.x.toFixed(3)}</span> Y<span style={{ color: '#79c0ff' }}>{pad.y.toFixed(3)}</span> mm</div>
+                    <div style={{ marginTop: 2, color: '#ce93d8' }}>
+                      Outer Boundary: <strong>{compDim.width.toFixed(2)} × {compDim.height.toFixed(2)} mm</strong> · Perimeter: <strong>{perim.toFixed(2)} mm</strong>
+                    </div>
                     {machineCoord ? (
                       <div style={{ marginTop: 4 }}>
                         <div>Predicted: X<span style={{ color: '#56d364' }}>{machineCoord.x.toFixed(3)}</span> Y<span style={{ color: '#56d364' }}>{machineCoord.y.toFixed(3)}</span> mm</div>
@@ -3253,7 +3443,15 @@ export default function AutomatedDispensingPanel({
                       style={{ flex: 2, background: machineCoord ? '#1f6feb' : '#444', minWidth: 80 }}
                       disabled={!machineCoord || !isConnected}
                       onClick={() => machineCoord && moveCameraToMachineCoord(machineCoord.x, machineCoord.y)}
-                    >📷 Move Camera Here</button>
+                    >📷 Center</button>
+
+                    <button
+                      className="btn secondary"
+                      style={{ flex: 2, minWidth: 100, border: '1px solid #ce93d8', color: '#ce93d8', fontWeight: 'bold' }}
+                      disabled={!machineCoord || !isConnected}
+                      onClick={handleTraceBoundary}
+                      title="Move camera crosshair around the outer boundary edges of this component"
+                    >📐 Trace Outline</button>
 
                     <button
                       className="btn secondary" style={{ flex: 1, minWidth: 60 }}
@@ -3517,7 +3715,7 @@ export default function AutomatedDispensingPanel({
 
               {dryRunMode && (
                 <div style={{ marginBottom: 10, padding: '6px 10px', background: 'rgba(31, 111, 235, 0.15)', border: '1px solid #388bfd', borderRadius: 5, color: '#79c0ff', fontSize: '0.82em', textAlign: 'center' }}>
-                  🎥 Camera Alignment Test Active — Machine will center camera on each component (no dispensing)
+                  🎥 Dry Run + Valve Active — will send {valveOnCmd || 'M8'} / {valveOffCmd || 'M9'} to Mega pin 8 (983A) per component
                 </div>
               )}
 

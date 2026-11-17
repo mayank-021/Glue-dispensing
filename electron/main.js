@@ -374,12 +374,21 @@ ipcMain.handle('serial:write', async (e, data) => {
 ipcMain.handle('serial:writeLine', async (e, line) => {
   if (!serial.port) throw new Error('Not connected');
   const sanitized = String(line).trim();
+  // Log glue valve / coolant commands clearly (983A on Mega D8 via M8/M9)
+  if (/^M8\b/i.test(sanitized) || /^M9\b/i.test(sanitized) || /^M3\b/i.test(sanitized) || /^M5\b/i.test(sanitized)) {
+    console.log(`[SERIAL VALVE] → "${sanitized}" (Mega coolant/spindle pin; M8=ON/HIGH M9=OFF/LOW)`);
+  }
   return new Promise((resolve, reject) => {
     // GRBL real-time single byte characters (?, !, ~, \x18, \x85) MUST NOT be followed by \r\n
     const isRealTime = sanitized === '?' || sanitized === '!' || sanitized === '~' || sanitized === '\x18' || sanitized === '\x85';
     const payload = isRealTime ? Buffer.from(sanitized, 'latin1') : sanitized + '\r\n';
     serial.port.write(payload, (err) => {
-      if (err) reject(err); else resolve(true);
+      if (err) {
+        console.error(`[SERIAL] writeLine FAILED "${sanitized}":`, err.message);
+        reject(err);
+      } else {
+        resolve(true);
+      }
     });
   });
 });

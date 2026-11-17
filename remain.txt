@@ -980,20 +980,20 @@ $22=1
 $23=7
 $24=15.000
 $25=60.000
-$26=250
+$26=25
 $27=10.000
 $30=255
 $31=0
 $32=0
-$100=40.000
-$101=40.000
-$102=110.000
-$110=1500.000
-$111=1500.000
-$112=100.000
-$120=150.000
-$121=150.000
-$122=1000.000
+$100=80     (X Steps/mm: 3200 / 40mm = 80)
+$101=80     (Y Steps/mm: 3200 / 40mm = 80)
+$102=110    (Z Steps/mm: 1600 / 8mm lead screw = 110)
+$110=1500   (X Max Speed: 1500 mm/min)
+$111=1500   (Y Max Speed: 1500 mm/min - matches X for equal rapid travel)
+$112=100    (Z Max Speed: 100 mm/min)
+$120=250    (X Acceleration: 250 mm/s²)
+$121=250    (Y Acceleration: 250 mm/s² - matched for clean 90-degree corners)
+$122=1000    (Z Acceleration: 1000 mm/s²)
 $130=300.000
 $131=300.000
 $132=300.000

@@ -7,10 +7,38 @@ export const defaultAxisMap = {
   R: "A", // map rotation to "A" by default; change to "E" or custom if your firmware needs it
 };
 
-export const defaultFeeds = {
-  travel: { X: 400, Y: 400, Z: 400, R: 400 }, // mm/min — smooth travel, avoids jerk on acceleration
-  work: { X: 400, Y: 400, Z: 240, R: 240 },
+/**
+ * Safe feeds matched to GRBL caps set on connect:
+ *   $110=500 (X max), $111=300 (Y max), $120≈80, $121≈50
+ * XY travel is capped to Y max so diagonal moves do not lose steps.
+ */
+export const SAFE_FEEDS = {
+  travelXY: 300,   // mm/min — rapid XY travel (≤ $111)
+  dispenseXY: 250, // mm/min — outline / bead tracing
+  z: 200,          // mm/min — Z plunge / retract
+  jog: 300,        // mm/min — manual / vision jogs
+  maxXY: 300,      // hard clamp for any XY F word
+  maxZ: 250,
 };
+
+export const defaultFeeds = {
+  travel: { X: SAFE_FEEDS.travelXY, Y: SAFE_FEEDS.travelXY, Z: SAFE_FEEDS.z, R: SAFE_FEEDS.jog },
+  work: { X: SAFE_FEEDS.dispenseXY, Y: SAFE_FEEDS.dispenseXY, Z: SAFE_FEEDS.z, R: SAFE_FEEDS.jog },
+};
+
+/** Clamp a feedrate (mm/min) to the safe XY envelope. */
+export function clampFeedXY(feed, fallback = SAFE_FEEDS.travelXY) {
+  const v = Number(feed);
+  if (!Number.isFinite(v) || v <= 0) return fallback;
+  return Math.max(1, Math.min(SAFE_FEEDS.maxXY, Math.round(v)));
+}
+
+/** Clamp a Z feedrate (mm/min). */
+export function clampFeedZ(feed, fallback = SAFE_FEEDS.z) {
+  const v = Number(feed);
+  if (!Number.isFinite(v) || v <= 0) return fallback;
+  return Math.max(1, Math.min(SAFE_FEEDS.maxZ, Math.round(v)));
+}
 
 export function header({ units = "mm", absolute = true } = {}) {
   const lines = [];
@@ -52,7 +80,10 @@ export function moveAbs({ x, y, z, r, feed }, axisMap = defaultAxisMap) {
   if (z !== undefined) parts.push(`${axisMap.Z}${fmt(z)}`);
   if (r !== undefined) parts.push(`${axisMap.R}${fmt(r)}`);
   if (!parts.length) return [];
-  const f = feed != null ? ` F${Math.max(1, Math.round(feed))}` : "";
+  const hasXY = x !== undefined || y !== undefined;
+  const f = feed != null
+    ? ` F${hasXY ? clampFeedXY(feed) : clampFeedZ(feed)}`
+    : "";
   return [`G1 ${parts.join(" ")}${f}`];
 }
 
@@ -63,7 +94,10 @@ export function jogRel({ dx, dy, dz, dr, feed }, axisMap = defaultAxisMap) {
   if (dz != null && Math.abs(dz) >= 0.001) parts.push(`${axisMap.Z}${Number(dz).toFixed(3)}`);
   if (dr != null && Math.abs(dr) >= 0.001) parts.push(`${axisMap.R}${Number(dr).toFixed(3)}`);
   if (!parts.length) return [];
-  const f = feed != null ? ` F${Math.max(1, Math.round(feed))}` : "";
+  const hasXY = (dx != null && Math.abs(dx) >= 0.001) || (dy != null && Math.abs(dy) >= 0.001);
+  const f = feed != null
+    ? ` F${hasXY ? clampFeedXY(feed) : clampFeedZ(feed)}`
+    : "";
   // GRBL v1.1+ native real-time jog: $J=G91 G21 X... Y... F...
   // Atomic, strictly relative, leaves G90 modal parser state untouched, and
   // completely prevents GRBL from misinterpreting small relative jog values
@@ -87,8 +121,8 @@ export function dispensePoint({
   x, y,
   zWork = 0.5,
   zSafe = 5,
-  feedXY = 1500,
-  feedZ = 500,
+  feedXY = SAFE_FEEDS.travelXY,
+  feedZ = SAFE_FEEDS.z,
   pressure = 0,
   dwellMs = 0,
   pwmDuty = 255,
@@ -130,9 +164,9 @@ export function dispenseBead({
   beadAxis = 'Y',
   zWork = 0.5,
   zSafe = 5,
-  feedXY = 1500,
-  feedZ = 500,
-  feedBead = 500,
+  feedXY = SAFE_FEEDS.travelXY,
+  feedZ = SAFE_FEEDS.z,
+  feedBead = SAFE_FEEDS.dispenseXY,
   pressure = 0,
   pwmDuty = 255,
   axisMap = defaultAxisMap
@@ -156,6 +190,71 @@ export function dispenseBead({
   // Trigger OFF — using fw.dispenserOff
   if (pressure > 0) cmds.push(fw.dispenserOff);
   // Retract to safe height
+  cmds.push(...moveAbs({ z: zSafe, feed: feedZ }, axisMap));
+
+  return cmds;
+}
+
+/**
+ * Dispense a continuous glue bead along the outer boundary/outline of a component.
+ *
+ * @param {Array<{x: number, y: number}>} boundaryPoints - Ordered perimeter vertices in machine coordinates
+ * @param {number} zWork - Dispensing height
+ * @param {number} zSafe - Safe clearance travel height
+ * @param {number} feedXY - Rapid travel feedrate (mm/min)
+ * @param {number} feedZ - Z plunge/retract feedrate (mm/min)
+ * @param {number} feedDispense - Perimeter tracing speed (mm/min)
+ * @param {number} pressure - Pressure setting / flag
+ * @param {number} pwmDuty - Valve PWM duty (default 255)
+ * @param {Object} axisMap - Machine axis mapping
+ * @returns {Array<string>} G-code command lines
+ */
+export function dispenseOutline({
+  boundaryPoints = [],
+  zWork = 0.5,
+  zSafe = 5,
+  feedXY = SAFE_FEEDS.travelXY,
+  feedZ = SAFE_FEEDS.z,
+  feedDispense = SAFE_FEEDS.dispenseXY,
+  pressure = 1,
+  pwmDuty = 255,
+  valveOn = null,
+  valveOff = null,
+  axisMap = defaultAxisMap
+}) {
+  if (!boundaryPoints || boundaryPoints.length < 2) return [];
+
+  const cmds = [];
+  const startPt = boundaryPoints[0];
+  const onCmd = valveOn || fw.dispenserOn(pwmDuty);
+  const offCmd = valveOff || fw.dispenserOff;
+
+  // 1. Travel to first boundary vertex at safe height (Signal: LOW/OFF)
+  cmds.push(...moveAbs({ x: startPt.x, y: startPt.y, z: zSafe, feed: feedXY }, axisMap));
+
+  // 2. Lower to dispensing work height (Signal: LOW/OFF)
+  cmds.push(...moveAbs({ z: zWork, feed: feedZ }, axisMap));
+
+  // 3. Trigger valve/dispenser ON (Signal: HIGH/ON — glue flows!)
+  cmds.push(onCmd);
+
+  // 4. Trace the outer boundary edges at dispensing feedrate (Signal: HIGH/ON)
+  for (let i = 1; i < boundaryPoints.length; i++) {
+    const pt = boundaryPoints[i];
+    cmds.push(...moveAbs({ x: pt.x, y: pt.y, feed: feedDispense }, axisMap));
+  }
+
+  // 5. Ensure closed perimeter back to start point (Signal: HIGH/ON)
+  const lastPt = boundaryPoints[boundaryPoints.length - 1];
+  const isClosed = Math.hypot(lastPt.x - startPt.x, lastPt.y - startPt.y) < 0.005;
+  if (!isClosed) {
+    cmds.push(...moveAbs({ x: startPt.x, y: startPt.y, feed: feedDispense }, axisMap));
+  }
+
+  // 6. Trigger valve/dispenser OFF (Signal: LOW/OFF — glue stops!)
+  cmds.push(offCmd);
+
+  // 7. Retract to safe height (Signal: LOW/OFF)
   cmds.push(...moveAbs({ z: zSafe, feed: feedZ }, axisMap));
 
   return cmds;

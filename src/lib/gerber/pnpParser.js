@@ -105,7 +105,16 @@ function estimateFootprintSize(footprint) {
 
   // SOT
   if (fp.includes('SOT23') || fp.includes('SOT-23')) return { width: 2.9, height: 1.3 };
+  if (fp.includes('SOT89') || fp.includes('SOT-89')) return { width: 4.5, height: 2.5 };
   if (fp.includes('SOT223') || fp.includes('SOT-223')) return { width: 6.5, height: 3.5 };
+
+  // Optocoupler / SOP-4
+  if (fp.includes('SOP-4') || fp.includes('SOP4') || fp.includes('SO-4') || fp.includes('SO4')) {
+    return { width: 4.6, height: 6.5 };
+  }
+  if (fp.includes('OPTO') || fp.includes('PC81') || fp.includes('PC817') || fp.includes('LTV')) {
+    return { width: 4.6, height: 6.5 };
+  }
 
   // DPAK / TO-252
   if (fp.includes('DPAK') || fp.includes('TO-252') || fp.includes('TO252')) return { width: 6.5, height: 6.0 };
